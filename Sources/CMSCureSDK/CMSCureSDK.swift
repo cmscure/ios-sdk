@@ -147,28 +147,20 @@ public class CMSCureSDK {
             print("🔍 Reading '\(key)' from '\(screenName)' in '\(self.currentLanguage)'")
         }
         
-        guard let tab = cache[screenName] as? [String: [String: String]] else {
-            if debugLogsEnabled {
-                print("⚠️ Screen '\(screenName)' not present or corrupted in cache")
+        if let tab = cache[screenName] {
+            if let keyMap = tab[key] {
+                if let translation = keyMap[self.currentLanguage] {
+                    return translation
+                }
+                if self.debugLogsEnabled {
+                    print("⚠️ No translation found for key '\(key)' in language '\(self.currentLanguage)'")
+                }
+            } else if self.debugLogsEnabled {
+                print("⚠️ Key '\(key)' not found or corrupted in tab '\(screenName)'")
             }
-            return ""
+        } else if self.debugLogsEnabled {
+            print("⚠️ Screen '\(screenName)' not present or corrupted in cache")
         }
-        
-        guard let keyMap = tab[key] else {
-            if self.debugLogsEnabled {
-                print("⚠️ Key '\(key)' not found in tab '\(screenName)'")
-            }
-            return ""
-        }
-        
-        if let translation = keyMap[self.currentLanguage] {
-            return translation
-        }
-        
-        if self.debugLogsEnabled {
-            print("⚠️ No translation found for key '\(key)' in language '\(self.currentLanguage)'")
-        }
-        
         return ""
     }
     
@@ -527,21 +519,16 @@ public class CMSCureSDK {
             print("🎨 Reading global color value for key '\(key)'")
         }
         
-        guard let colorTab = cache["__colors__"] else {
-            if self.debugLogsEnabled {
-                print("⚠️ Global color tab '__colors__' not found in cache")
-            }
-            return nil
-        }
-        
-        guard let valueMap = colorTab[key] else {
-            if self.debugLogsEnabled {
+        if let colorTab = cache["__colors__"] {
+            if let valueMap = colorTab[key] {
+                return valueMap["color"]
+            } else if self.debugLogsEnabled {
                 print("⚠️ Color key '\(key)' not found in global tab '__colors__'")
             }
-            return nil
+        } else if self.debugLogsEnabled {
+            print("⚠️ Global color tab '__colors__' not found in cache")
         }
-        
-        return valueMap["color"]
+        return nil
     }
     
     private func readTokenFromConfig() -> String? {
@@ -766,7 +753,7 @@ public class CMSCureSDK {
     }
     
     private func syncIfOutdated() {
-    let tabsToSync = Array(Set(self.cache.keys).union(Set(self.offlineTabList)).union(["__colors__"]))
+        let tabsToSync = Array(Set(self.cache.keys).union(Set(self.offlineTabList)).union(["__colors__","__images__"]))
         
         for tab in tabsToSync {
             self.sync(screenName: tab) { success in
@@ -966,6 +953,33 @@ public final class CureColor: ObservableObject {
 
     @objc private func updateValue(_ notification: Notification) {
         self.value = Color(hex: Cure.shared.colorValue(for: key))
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+public final class CureImage: ObservableObject {
+    private let key: String
+
+    @Published public private(set) var value: Image?
+
+    public init(_ key: String) {
+        self.key = key
+        let imageName = Cure.shared.translation(for: key, inTab: "__images__")
+        self.value = imageName.isEmpty ? nil : Image(imageName)
+
+        NotificationCenter.default.addObserver(self, selector: #selector(updateValue), name: .translationsUpdated, object: nil)
+    }
+
+    @objc private func updateValue(_ notification: Notification) {
+        let imageName = Cure.shared.translation(for: key, inTab: "__images__")
+        if !imageName.isEmpty {
+            self.value = Image(imageName)
+        } else {
+            self.value = nil
+        }
     }
 
     deinit {
