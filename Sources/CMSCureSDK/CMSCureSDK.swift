@@ -862,17 +862,6 @@ extension String {
         _ = bridgeWatcher
         return Cure.shared.translation(for: self, inTab: tab)
     }
-
-    public func cureNumber(tab: String) -> Double? {
-        _ = bridgeWatcher
-        return Double(Cure.shared.translation(for: self, inTab: tab))
-    }
-
-    public var cureImage: Image? {
-        _ = bridgeWatcher
-        let imageName = Cure.shared.translation(for: self, inTab: "__images__")
-        return imageName.isEmpty ? nil : Image(imageName)
-    }
 }
 
 public final class CureString: ObservableObject {
@@ -895,33 +884,6 @@ public final class CureString: ObservableObject {
               updatedTab == tab || updatedTab == "__ALL__" else { return }
 
         self.value = Cure.shared.translation(for: key, inTab: tab)
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
-}
-
-public final class CureNumber: ObservableObject {
-    private let key: String
-    private let tab: String
-
-    @Published public private(set) var value: Double?
-
-    public init(_ key: String, tab: String) {
-        self.key = key
-        self.tab = tab
-        self.value = Double(Cure.shared.translation(for: key, inTab: tab))
-
-        NotificationCenter.default.addObserver(self, selector: #selector(updateValue), name: .translationsUpdated, object: nil)
-    }
-
-    @objc private func updateValue(_ notification: Notification) {
-        guard let userInfo = notification.userInfo,
-              let updatedTab = userInfo["screenName"] as? String,
-              updatedTab == tab || updatedTab == "__ALL__" else { return }
-
-        self.value = Double(Cure.shared.translation(for: key, inTab: tab))
     }
 
     deinit {
@@ -953,33 +915,6 @@ public final class CureColor: ObservableObject {
 
     @objc private func updateValue(_ notification: Notification) {
         self.value = Color(hex: Cure.shared.colorValue(for: key))
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
-}
-
-public final class CureImage: ObservableObject {
-    private let key: String
-
-    @Published public private(set) var value: Image?
-
-    public init(_ key: String) {
-        self.key = key
-        let imageName = Cure.shared.translation(for: key, inTab: "__images__")
-        self.value = imageName.isEmpty ? nil : Image(imageName)
-
-        NotificationCenter.default.addObserver(self, selector: #selector(updateValue), name: .translationsUpdated, object: nil)
-    }
-
-    @objc private func updateValue(_ notification: Notification) {
-        let imageName = Cure.shared.translation(for: key, inTab: "__images__")
-        if !imageName.isEmpty {
-            self.value = Image(imageName)
-        } else {
-            self.value = nil
-        }
     }
 
     deinit {
