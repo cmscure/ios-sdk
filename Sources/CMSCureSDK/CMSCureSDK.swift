@@ -18,7 +18,7 @@ public class CMSCureSDK {
     private var projectSecret: String
     private var apiSecret: String?
     private var symmetricKey: SymmetricKey?
-    private var serverUrl = "10.12.23.144" // Consider making this configurable
+    private var serverUrl = "https://app.cmscure.com" // Consider making this configurable
     
     public var debugLogsEnabled: Bool = true
     public var pollingInterval: TimeInterval = 300 {
@@ -289,9 +289,27 @@ public class CMSCureSDK {
         }
         
         // Construct URL - Ensure serverUrl is correct
-        guard let url = URL(string: "http://\(serverUrl):5050/api/sdk/translations/\(projectId)/\(screenName)") else {
-             if self.debugLogsEnabled {
-                print("❌ Sync failed for '\(screenName)': Invalid URL components.")
+        guard let socketUrl = URL(string: "wss://app.cmscure.com") else { // Use serverUrl directly
+            if self.debugLogsEnabled { print("❌ Invalid socket URL: \(serverUrl)") }
+            return
+        }
+        
+        // Ensure manager and socket are created if nil
+        if manager == nil || socket == nil {
+            manager = SocketManager(socketURL: socketUrl, config: [.log(debugLogsEnabled), .compress, .reconnects(true), .reconnectAttempts(-1), .reconnectWait(3), .reconnectWaitMax(10)]) // Pass the correct socketURL
+            socket = manager?.defaultSocket
+            setupSocketHandlers(projectId: projectId) // Setup handlers only once
+        }
+
+        if self.debugLogsEnabled {
+            print("🔌 Attempting to connect socket to \(socketUrl)...") // Log the correct URL
+        }
+        socket?.connect()
+        
+        let apiBaseUrl = "https://app.cmscure.com" // Use HTTPS for API calls
+        guard let url = URL(string: "\(apiBaseUrl)/api/sdk/translations/\(projectId)/\(screenName)") else {
+            if self.debugLogsEnabled {
+               print("❌ Sync failed for '\(screenName)': Invalid URL components.")
             }
             completion(false)
             return
@@ -462,7 +480,7 @@ public class CMSCureSDK {
             return
         }
         
-        guard let url = URL(string: "http://\(serverUrl):5050") else {
+        guard let url = URL(string: serverUrl) else {
              if self.debugLogsEnabled { print("❌ Invalid socket URL.") }
              return
         }
@@ -646,7 +664,7 @@ public class CMSCureSDK {
         // Set the secret immediately for encryption
         setAPISecret(projectSecret)
         
-        guard let url = URL(string: "http://\(serverUrl):5050/api/sdk/auth?projectId=\(projectId)") else {
+        guard let url = URL(string: "\(serverUrl)/api/sdk/auth?projectId=\(projectId)") else {
              if self.debugLogsEnabled { print("❌ Auth failed: Invalid URL.") }
              completion(false)
              return
@@ -743,6 +761,32 @@ public class CMSCureSDK {
                 completion(false)
             }
         }.resume()
+    }
+    
+    /// Retrieves the image URL string for a given key and screen name in the current language.
+    /// Returns nil if the key, screen, or language value is not found or not a valid URL string.
+    public func imageUrl(for key: String, inTab screenName: String) -> URL? {
+        // Use the existing thread-safe translation method to get the URL string
+        let urlString = self.translation(for: key, inTab: screenName) // Re-use translation logic
+
+        guard !urlString.isEmpty else {
+            if self.debugLogsEnabled {
+                print("⚠️ Image URL string not found for key '\(key)' in tab '\(screenName)' (Lang: \(getLanguage()))")
+            }
+            return nil
+        }
+
+        guard let url = URL(string: urlString) else {
+             if self.debugLogsEnabled {
+                print("❌ Invalid URL format for key '\(key)' in tab '\(screenName)': \(urlString)")
+            }
+            return nil
+        }
+        
+        if self.debugLogsEnabled {
+            // print("🖼️ Resolved image URL for '\(key)'/\(screenName)': \(url)") // Can be noisy
+        }
+        return url
     }
     
     // MARK: - Update Handling & Notifications
@@ -1032,7 +1076,7 @@ public class CMSCureSDK {
             return
         }
         
-        guard let url = URL(string: "http://\(serverUrl):5050/api/sdk/languages/\(projectId)") else {
+        guard let url = URL(string: "\(serverUrl)/api/sdk/languages/\(projectId)") else {
              if self.debugLogsEnabled { print("❌ Fetch languages failed: Invalid URL.")}
              completion([])
              return
@@ -1292,6 +1336,38 @@ public final class CureColor: ObservableObject {
     
     // No need for NotificationCenter observation if using the bridge publisher
     // deinit { NotificationCenter.default.removeObserver(self) }
+}
+
+/// Observable object to automatically update a URL value (intended for images) in SwiftUI views.
+public final class CureImage: ObservableObject {
+    private let key: String
+    private let tab: String
+    private var cancellable: AnyCancellable? = nil
+
+    @Published public private(set) var value: URL? // Stores the URL for the image
+
+    public init(_ key: String, tab: String) {
+        self.key = key
+        self.tab = tab
+        // Initial value fetch (implement imageUrl function in SDK)
+        self.value = Cure.shared.imageUrl(for: key, inTab: tab) // <- New SDK function needed
+
+        // Observe the bridge's refreshToken publisher for updates
+        cancellable = CureTranslationBridge.shared.$refreshToken
+            .receive(on: DispatchQueue.main) // Ensure updates happen on main thread
+            .sink { [weak self] _ in
+                self?.updateValue()
+            }
+    }
+
+    private func updateValue() {
+        // Fetching the value is thread-safe (assuming imageUrl is)
+        let newValue = Cure.shared.imageUrl(for: key, inTab: tab) // <- New SDK function needed
+        // Update @Published property only if value changed
+        if newValue != self.value {
+            self.value = newValue
+        }
+    }
 }
 
 // SocketIOClient status description helper
