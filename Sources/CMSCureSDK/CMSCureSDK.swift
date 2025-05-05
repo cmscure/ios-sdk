@@ -1,328 +1,338 @@
-#if canImport(UIKit)
-import UIKit
-#endif
+// Standard Library & System Frameworks
 import Foundation
-// NOTE: Ensure SwiftUICore is the correct import for Color. If using SwiftUI, it should be `import SwiftUI`.
-// If using UIKit, you might need a different Color type or extension.
-import SwiftUI // Assuming SwiftUI for Color type. Adjust if using UIKit.
-import SocketIO
-import CryptoKit
-import Combine
+#if canImport(UIKit)
+import UIKit // For app lifecycle notifications
+#endif
 
+// Third-Party Frameworks
+import SocketIO // Socket.IO Client Library
+import CryptoKit // For SHA256, AES.GCM, HMAC
+import Combine // For SwiftUI integration (@Published, ObservableObject)
+import SwiftUI // For Color type and SwiftUI helpers
+
+/// Convenience typealias for the SDK singleton
 public typealias Cure = CMSCureSDK
 
+/// The main class for interacting with the CMSCure backend and managing content.
+/// NOTE: This version uses the original custom encryption and socket handshake logic.
 public class CMSCureSDK {
+    /// Shared singleton instance for accessing SDK functionality.
     public static let shared = CMSCureSDK()
+
+    // MARK: - Configuration & State
+
+    // --- Server URL Configuration ---
+    /// Base URL for API calls, determined by build configuration.
+    #if DEBUG
+    // Use local IP/hostname for Debug builds (ensure backend is accessible)
+    private var serverUrl = "http://10.12.23.144:5050" // Use original variable name
+    /// Explicit URL for Socket.IO connections, determined by build configuration.
+    private var socketIOURL = "ws://10.12.23.144:5050"   // Use original variable name
+    #else
+    // Use production URLs for Release builds
+    /// Base URL for API calls, determined by build configuration.
+    private var serverUrl = "https://app.cmscure.com" // Your production API endpoint
+    /// Explicit URL for Socket.IO connections, determined by build configuration.
+    private var socketIOURL = "wss://app.cmscure.com"  // Your production Socket.IO endpoint (use wss for HTTPS)
+    #endif
+
+    // --- Credentials & Tokens (Access MUST be synchronized via cacheQueue) ---
+    /// The project secret provided during authentication (used for socket handshake).
+    private var projectSecret: String = ""
+    /// The API secret provided during authentication (used for deriving encryption key).
+    private var apiSecret: String? = nil // Should typically be the same as projectSecret for this flow
+    /// Symmetric key derived from apiSecret for encrypting API requests.
+    private var symmetricKey: SymmetricKey? = nil
+    /// Auth token received from the original /api/sdk/auth endpoint (might be JWT or custom).
+    private var authToken: String? = nil // Store the token received from the original auth endpoint
     
-    // --- Configuration & State ---
-    private var projectSecret: String
-    private var apiSecret: String?
-    private var symmetricKey: SymmetricKey?
-    private var serverUrl = "https://app.cmscure.com" // Consider making this configurable
-    
+    private var knownProjectTabs: Set<String> = []
+
+    // --- SDK Settings ---
+    /// Flag to enable/disable verbose logging to the console.
     public var debugLogsEnabled: Bool = true
+    /// Interval (in seconds) for periodically checking for content updates via polling. Defaults to 5 minutes.
     public var pollingInterval: TimeInterval = 300 {
         didSet {
-            // Enforce bounds for polling interval
-            pollingInterval = max(60, min(pollingInterval, 600))
-            // TODO: Restart timer if interval changes while running
+            pollingInterval = max(60, min(pollingInterval, 600)) // Enforce bounds
+            DispatchQueue.main.async { // Timer operations should be on main thread
+                if self.pollingTimer != nil { self.setupPollingTimer() }
+            }
         }
     }
-    
-    // --- Cache & Language ---
+
+    // --- Cache & Language (Access MUST be synchronized via cacheQueue) ---
+    /// In-memory cache storing fetched translations and colors. Structure: `[ScreenName: [Key: [Lang: Value]]]`
+    private var cache: [String: [String: [String: String]]] = [:]
+    /// The currently active language code (e.g., "en", "fr").
+    private var currentLanguage: String = "en"
+    /// List of known tab names associated with the authenticated project (loaded from disk). Used by syncIfOutdated.
+    private var offlineTabList: [String] = [] // Use original variable name
+
+    // --- Persistence Paths ---
+    /// File URL for storing the content cache (`cache.json`).
     private let cacheFilePath: URL = {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCure")
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK") // Original folder name
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("cache.json")
     }()
-    // The core cache: screenName -> [key: [language: value]]
-    private var cache: [String: [String: [String: String]]] = [:]
-    private var currentLanguage: String = "en"
-    private var offlineTabList: [String] = [] // List of tabs known from last session
-    
-    // --- Synchronization ---
-    // Serial queue to synchronize access to `cache` and `currentLanguage`
+    /// File URL for storing the list of known project tabs (`tabs.json`).
+    private let tabsFilePath: URL = { // Use original name pattern if preferred
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("tabs.json") // Changed from offlineTabListFilePath
+    }()
+    /// File URL for storing the configuration (token, secrets) (`config.json`).
+    private let configFilePath: URL = {
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("config.json")
+    }()
+
+
+    // --- Synchronization Queue ---
+    /// Concurrent queue to manage thread-safe access to shared state (cache, token, tabs list). Writes use barriers.
+    // Using a serial queue as per the originally uploaded file
     private let cacheQueue = DispatchQueue(label: "com.cmscure.cacheQueue")
-    
+
     // --- Networking & Updates ---
+    /// The Socket.IO client instance. Access synchronized or on main thread.
     private var socket: SocketIOClient?
+    /// The Socket.IO manager instance. Access synchronized or on main thread.
     private var manager: SocketManager?
+    /// Timer for periodic polling syncs. Managed on the main thread.
     private var pollingTimer: Timer?
-    private var lastSyncCheck: Date? // To potentially avoid redundant syncs
-    private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:] // Handlers for specific screen updates
-    
-    // --- Initialization ---
+    /// Dictionary holding callback closures provided by the app for specific screen updates. Managed on the main thread.
+    private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
+    /// State to track if the custom handshake has been acknowledged. Reset on disconnect.
+    private var handshakeAcknowledged = false
+    /// Stores the last sync check time to potentially avoid redundant syncs (though not fully implemented in syncIfOutdated).
+    private var lastSyncCheck: Date?
+
+    // MARK: - Initialization
+
+    /// Private initializer for the singleton pattern. Loads state and attempts connection.
     private init() {
-        self.projectSecret = "" // Initialize, should be set by authenticate
-        self.apiSecret = nil
-        self.symmetricKey = nil
-        
-        // Load initial state
-        loadCacheFromDisk() // Accesses cache, happens safely before concurrency starts
+        // Load initial state synchronously (safe during init)
+        loadCacheFromDisk()
+        // offlineTabList is loaded within loadCacheFromDisk in this version
         self.currentLanguage = UserDefaults.standard.string(forKey: "selectedLanguage") ?? "en"
-        
-        // Setup background tasks
-        startListening() // Setup socket connection if config exists
-        observeAppActiveNotification()
-        setupPollingTimer()
+        // Attempt to load saved config (token and secrets)
+        if let savedConfig = readConfig() {
+            self.authToken = savedConfig["authToken"]
+            self.projectSecret = savedConfig["projectSecret"] ?? ""
+            // Use projectSecret as the apiSecret for key derivation in this original flow
+            if !self.projectSecret.isEmpty {
+                 setAPISecret(self.projectSecret) // Derive symmetric key
+            }
+        }
+
+        // Setup background tasks & listeners (on main thread)
+        DispatchQueue.main.async {
+            self.observeAppActiveNotification()
+            self.setupPollingTimer()
+            // Try to connect socket if config exists (original behavior)
+            self.startListening()
+        }
+
+        // Initial log messages
+        if debugLogsEnabled {
+            print("🚀 CMSCureSDK Initialized (Reverted Original - Corrected).")
+            print("   - API Base URL: \(serverUrl)") // Use correct variable
+            print("   - Socket Base URL: \(socketIOURL)") // Use correct variable
+            print("   - Initial Offline Tabs: \(offlineTabList)") // Log offline tabs
+            if self.authToken != nil {
+                print("   - Found saved auth token.")
+            } else {
+                print("   - No saved auth token found. Waiting for authenticate() call.")
+            }
+        }
     }
-    
+
     // MARK: - Public Configuration
-    
+
     /// Sets the API Secret used for encryption/decryption and derives the symmetric key.
-    /// Should be called before making authenticated requests if not using `authenticate`.
+    /// Called internally during `authenticate`. Ensures thread safety.
     public func setAPISecret(_ secret: String) {
-        // Synchronize access as this modifies shared crypto state
-        cacheQueue.async {
+        cacheQueue.async { // Use async for potential background derivation
             self.apiSecret = secret
             if let secretData = secret.data(using: .utf8) {
+                // Use SHA256 from CryptoKit to derive the key
                 self.symmetricKey = SymmetricKey(data: SHA256.hash(data: secretData))
-                if self.debugLogsEnabled {
-                    print("🔑 Symmetric key derived from API secret.")
-                }
+                if self.debugLogsEnabled { print("🔑 Symmetric key derived.") }
             } else {
-                 if self.debugLogsEnabled {
-                    print("⚠️ Failed to create data from API secret string.")
-                }
+                 if self.debugLogsEnabled { print("⚠️ Failed to create data from API secret string.") }
+                 self.symmetricKey = nil // Ensure key is nil if derivation fails
             }
         }
     }
-    
-    /// Sets the current language, updates UserDefaults, and triggers UI/cache updates.
+
+    /// Sets the current language, updates UserDefaults, and triggers UI/cache updates for all known tabs.
     /// - Parameters:
     ///   - language: The new language code (e.g., "en", "fr").
-    ///   - force: If true, forces sync even if language is the same (rarely needed).
-    ///   - completion: Called after all sync operations for the language change are attempted.
+    ///   - force: If true, forces sync even if language is the same.
+    ///   - completion: Optional closure called after sync operations are attempted.
     public func setLanguage(_ language: String, force: Bool = false, completion: (() -> Void)? = nil) {
-        // Read current language and get cache keys synchronously
-        let (shouldUpdate, screensToUpdate) = cacheQueue.sync { () -> (Bool, [String]) in
-            let needsUpdate = (language != self.currentLanguage || force)
-            if needsUpdate {
+        var shouldUpdate = false
+        var screensToUpdate: [String] = []
+
+        // Check if update is needed and get tabs list (thread-safe read)
+        cacheQueue.sync {
+            if language != self.currentLanguage || force {
+                shouldUpdate = true
                 self.currentLanguage = language // Update language synchronously
-                UserDefaults.standard.set(language, forKey: "selectedLanguage")
+                UserDefaults.standard.set(language, forKey: "selectedLanguage") // Persist preference
+                // Get combined list of cached tabs and known offline tabs
+                screensToUpdate = Array(Set(self.cache.keys).union(Set(self.offlineTabList)))
             }
-            // Return whether update is needed and the list of screens to update
-            return (needsUpdate, Array(self.cache.keys))
         }
-        
+
+        // Exit if no update needed
         guard shouldUpdate else {
             completion?()
             return
         }
-        
-        if self.debugLogsEnabled {
-            print("🔄 Switching to language '\(language)'")
-        }
-        
+
+        if self.debugLogsEnabled { print("🔄 Switching to language '\(language)'") }
+
+        // Use DispatchGroup to wait for all syncs to complete (optional)
         let group = DispatchGroup()
-        
+
         for screenName in screensToUpdate {
-            if self.debugLogsEnabled {
-                print("🔄 Updating language for tab '\(screenName)'")
-            }
-            
+            if self.debugLogsEnabled { print("🔄 Updating language for tab '\(screenName)'") }
             // Immediately trigger UI update with cached data for the new language
-            // Read cache synchronously
             let cachedValues = self.getCachedTranslations(for: screenName, language: language)
             DispatchQueue.main.async {
                 self.notifyUpdateHandlers(screenName: screenName, values: cachedValues)
             }
-            
             // Then sync in background for latest updates
             group.enter()
             self.sync(screenName: screenName) { success in
-                if success {
-                    // If sync succeeded, trigger another UI update with potentially newer data
-                    let updatedValues = self.getCachedTranslations(for: screenName, language: language)
-                    DispatchQueue.main.async {
-                         self.notifyUpdateHandlers(screenName: screenName, values: updatedValues)
-                    }
-                }
+                 // Sync function handles its own UI updates now
                 group.leave()
             }
         }
-        
-        // Notify completion when all syncs are done
-        group.notify(queue: .main) {
-            completion?()
-        }
+        group.notify(queue: .main) { completion?() }
     }
-    
-    /// Gets the currently active language code.
+
+    /// Gets the currently active language code. Thread-safe read.
     public func getLanguage() -> String {
-        // Synchronize read access
         return cacheQueue.sync { self.currentLanguage }
     }
-    
-    /// Clears the in-memory and on-disk cache.
-    public func clearCache() {
-        // Synchronize write access
-        cacheQueue.async(flags: .barrier) { // Use barrier to ensure this completes before other writes
+
+    /// Clears all SDK data: in-memory cache, known tabs list, auth token, keys, and persisted files.
+    public func clearCache() { // Use original function name
+        cacheQueue.async { // Use async for file operations
+            // Clear in-memory state
             self.cache.removeAll()
             self.offlineTabList.removeAll()
+            self.authToken = nil
+            self.symmetricKey = nil
+            self.projectSecret = ""
+            self.apiSecret = nil
+            self.handshakeAcknowledged = false
+
+            // Delete persisted files
             do {
                 if FileManager.default.fileExists(atPath: self.cacheFilePath.path) {
                     try FileManager.default.removeItem(at: self.cacheFilePath)
                 }
-                let tabListPath = self.cacheFilePath.deletingLastPathComponent().appendingPathComponent("tabs.json")
-                 if FileManager.default.fileExists(atPath: tabListPath.path) {
-                    try FileManager.default.removeItem(at: tabListPath)
+                // Use tabsFilePath here
+                if FileManager.default.fileExists(atPath: self.tabsFilePath.path) {
+                    try FileManager.default.removeItem(at: self.tabsFilePath)
                 }
-                if self.debugLogsEnabled {
-                    print("🧹 Cache cleared.")
+                 if FileManager.default.fileExists(atPath: self.configFilePath.path) {
+                    try FileManager.default.removeItem(at: self.configFilePath)
                 }
+                if self.debugLogsEnabled { print("🧹 Cache, Tabs List, and Config files cleared.") }
             } catch {
-                 if self.debugLogsEnabled {
-                    print("❌ Failed to delete cache files: \(error)")
+                 if self.debugLogsEnabled { print("❌ Failed to delete cache/config files: \(error)") }
+            }
+            // Notify UI components to clear their state
+            DispatchQueue.main.async {
+                for screenName in self.translationUpdateHandlers.keys {
+                    self.notifyUpdateHandlers(screenName: screenName, values: [:])
                 }
             }
-            // Notify UI that cache is cleared (optional, might require specific handling)
-            // Consider posting a specific notification if needed
         }
     }
-    
-    // MARK: - Core Translation & Color Access
-    
-    /// Retrieves the translation for a given key and screen name in the current language.
-    /// Returns an empty string if the key, screen, or language translation is not found.
+
+    // MARK: - Core Translation & Color Access (Thread-safe Reads)
+
+    /// Retrieves the translation for a given key and screen name in the current language. Thread-safe.
     public func translation(for key: String, inTab screenName: String) -> String {
-        // Synchronize read access to cache and currentLanguage
-        return cacheQueue.sync {
-            let lang = self.currentLanguage // Read language inside sync block
-            if self.debugLogsEnabled {
-                // Limit frequency of logs if needed, this can be noisy
-                // print("🔍 Reading '\(key)' from '\(screenName)' in '\(lang)'")
-            }
-            
-            guard let tabCache = cache[screenName] else {
-                if self.debugLogsEnabled {
-                    print("⚠️ Screen '\(screenName)' not present in cache for key '\(key)'")
+        return cacheQueue.sync { // Synchronized read
+            let lang = self.currentLanguage
+            if self.debugLogsEnabled { /* print("🔍 Reading '\(key)' from '\(screenName)' in '\(lang)'") */ }
+            guard let tabCache = cache[screenName], let keyMap = tabCache[key], let translation = keyMap[lang] else {
+                if self.debugLogsEnabled && (cache[screenName] == nil || cache[screenName]?[key] == nil || cache[screenName]?[key]?[lang] == nil) {
+                     // print("⚠️ Translation missing: \(screenName)/\(key)/\(lang)")
                 }
                 return ""
             }
-            
-            guard let keyMap = tabCache[key] else {
-                 if self.debugLogsEnabled {
-                    print("⚠️ Key '\(key)' not found in tab '\(screenName)'")
-                }
-                return ""
-            }
-            
-            guard let translation = keyMap[lang] else {
-                if self.debugLogsEnabled {
-                    print("⚠️ No translation found for key '\(key)' in language '\(lang)' (Tab: \(screenName))")
-                }
-                // Optionally fallback to a default language like "en"
-                // return keyMap["en"] ?? ""
-                return ""
-            }
-            
             return translation
         }
     }
-    
-    /// Retrieves the color hex string for a given global color key.
-    /// Looks for the key within the special `__colors__` tab.
+
+    /// Retrieves the color hex string for a given global color key (from `__colors__` tab). Thread-safe.
     public func colorValue(for key: String) -> String? {
-        // Synchronize read access
-        return cacheQueue.sync {
-            if self.debugLogsEnabled {
-                // print("🎨 Reading global color value for key '\(key)'")
-            }
-            
-            // Access cache safely within the sync block
-            guard let colorTab = cache["__colors__"] else {
-                if self.debugLogsEnabled {
-                    print("⚠️ Global color tab '__colors__' not found in cache for key '\(key)'")
+        return cacheQueue.sync { // Synchronized read
+            if self.debugLogsEnabled { /* print("🎨 Reading global color value for key '\(key)'") */ }
+            guard let colorTab = cache["__colors__"], let valueMap = colorTab[key], let colorHex = valueMap["color"] else {
+                if self.debugLogsEnabled && (cache["__colors__"] == nil || cache["__colors__"]?[key] == nil || cache["__colors__"]?[key]?["color"] == nil) {
+                    // print("⚠️ Color missing: \(key)")
                 }
                 return nil
             }
-            
-            guard let valueMap = colorTab[key] else {
-                if self.debugLogsEnabled {
-                    print("⚠️ Color key '\(key)' not found in global tab '__colors__'")
-                }
-                return nil
-            }
-            
-            // Assuming color value is stored under the key "color" within the valueMap
-            guard let colorHex = valueMap["color"] else {
-                 if self.debugLogsEnabled {
-                    print("⚠️ 'color' field not found for key '\(key)' in '__colors__'")
-                }
-                return nil
-            }
-            
             return colorHex
         }
     }
-    
-    /// Retrieves all cached translations for a specific screen and language.
-    /// Used internally for notifying handlers.
+
+    /// Retrieves the image URL for a given key and screen name in the current language. Thread-safe.
+    public func imageUrl(for key: String, inTab screenName: String) -> URL? {
+        let urlString = self.translation(for: key, inTab: screenName) // Uses thread-safe translation()
+        guard !urlString.isEmpty, let url = URL(string: urlString) else {
+            if self.debugLogsEnabled && !urlString.isEmpty { print("❌ Invalid URL format for key '\(key)' in tab '\(screenName)': \(urlString)") }
+            return nil
+        }
+        return url
+    }
+
+    /// Retrieves all cached translations for a specific screen and language. Used internally. Thread-safe read.
     private func getCachedTranslations(for screenName: String, language: String) -> [String: String] {
-        // Synchronize read access
-        return cacheQueue.sync {
-            var values: [String: String] = [:]
-            if let tabCache = self.cache[screenName] {
-                for (key, valueMap) in tabCache {
-                    if let translatedValue = valueMap[language] {
-                        values[key] = translatedValue
-                    }
-                }
-            }
-            return values
+         return cacheQueue.sync { // Synchronized read
+            var values: [String: String] = [:]; if let tabCache = self.cache[screenName] { for (key, valueMap) in tabCache { values[key] = valueMap[language] } }; return values.compactMapValues { $0 }
         }
     }
-    
-    // MARK: - Synchronization Logic
-    
-    /// Fetches the latest translations for a specific screen name from the server.
-    /// Updates the cache and notifies relevant handlers upon success.
+
+    // MARK: - Synchronization Logic (Original Encryption Method)
+
+    /// Fetches the latest translations/colors using the original encryption method.
     public func sync(screenName: String, completion: @escaping (Bool) -> Void) {
-        // Read config synchronously before going async
-        guard let token = readTokenFromConfig(), let projectId = readProjectIdFromConfig() else {
-            if self.debugLogsEnabled {
-                print("❌ Sync failed for '\(screenName)': Missing auth token or project ID")
-            }
-            completion(false)
-            return
-        }
-        
-        // Construct URL - Ensure serverUrl is correct
-        guard let socketUrl = URL(string: "wss://app.cmscure.com") else { // Use serverUrl directly
-            if self.debugLogsEnabled { print("❌ Invalid socket URL: \(serverUrl)") }
-            return
-        }
-        
-        // Ensure manager and socket are created if nil
-        if manager == nil || socket == nil {
-            manager = SocketManager(socketURL: socketUrl, config: [.log(debugLogsEnabled), .compress, .reconnects(true), .reconnectAttempts(-1), .reconnectWait(3), .reconnectWaitMax(10)]) // Pass the correct socketURL
-            socket = manager?.defaultSocket
-            setupSocketHandlers(projectId: projectId) // Setup handlers only once
+        // Read required credentials safely
+        var currentProjectId: String?
+        cacheQueue.sync { currentProjectId = self.readProjectIdFromConfig() }
+
+        guard let projectId = currentProjectId else {
+            if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': Missing project ID.") }
+            completion(false); return
         }
 
-        if self.debugLogsEnabled {
-            print("🔌 Attempting to connect socket to \(socketUrl)...") // Log the correct URL
+        // Construct the API URL using serverUrl
+        guard let url = URL(string: "\(serverUrl)/api/sdk/translations/\(projectId)/\(screenName)") else {
+            if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': Invalid URL components. Base URL: \(serverUrl)") }
+            completion(false); return
         }
-        socket?.connect()
-        
-        let apiBaseUrl = "https://app.cmscure.com" // Use HTTPS for API calls
-        guard let url = URL(string: "\(apiBaseUrl)/api/sdk/translations/\(projectId)/\(screenName)") else {
-            if self.debugLogsEnabled {
-               print("❌ Sync failed for '\(screenName)': Invalid URL components.")
-            }
-            completion(false)
-            return
-        }
-        
+
+        // Prepare the URLRequest
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 15 // Add a timeout
-        
-        // Prepare body and signature (read symmetricKey synchronously)
+        request.timeoutInterval = 15
+
+        // --- *** Prepare Encrypted Body and Signature (Original Method) *** ---
         let (encryptedBody, signature) = cacheQueue.sync { () -> (Data?, String?) in
-            let bodyDict = ["projectId": projectId, "screenName": screenName]
+            let bodyDict: [String: Any] = ["projectId": projectId, "screenName": screenName]
             let encrypted = self.encryptBody(bodyDict)
             var sig: String? = nil
             if let bodyData = encrypted, let key = self.symmetricKey {
@@ -331,707 +341,607 @@ public class CMSCureSDK {
             }
             return (encrypted, sig)
         }
-        
+
         guard let finalEncryptedBody = encryptedBody else {
-            if self.debugLogsEnabled {
-                print("❌ Sync failed for '\(screenName)': Failed to encrypt request body.")
-            }
-            completion(false)
-            return
+            if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': Failed to encrypt request body.") }
+            completion(false); return
         }
-        
         request.httpBody = finalEncryptedBody
+
         if let finalSignature = signature {
             request.setValue(finalSignature, forHTTPHeaderField: "X-Signature")
         } else if self.debugLogsEnabled {
              print("⚠️ Sync warning for '\(screenName)': Could not generate signature (symmetric key missing?).")
         }
-        
-        // Perform network request
+        // --- *** END Encryption/Signature *** ---
+
+        if debugLogsEnabled { print("🔄 Syncing '\(screenName)' (Using Encryption)...") }
+
+        // Execute the network request
         URLSession.shared.dataTask(with: request) { data, response, error in
-            // Check for network errors
+            // Handle Network Errors
             if let error = error {
-                if self.debugLogsEnabled {
-                    print("❌ Sync failed for '\(screenName)': Network error - \(error.localizedDescription)")
-                }
-                completion(false)
-                return
+                if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': Network error - \(error.localizedDescription)") }
+                completion(false); return
             }
-            
-            // Check HTTP status code
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                if self.debugLogsEnabled {
-                    print("❌ Sync failed for '\(screenName)': HTTP status code \(statusCode)")
-                    if let data = data, let responseBody = String(data: data, encoding: .utf8) {
-                        print("   Response Body: \(responseBody)")
-                    }
-                }
-                completion(false)
-                return
+            // Validate HTTP Response
+            guard let httpResponse = response as? HTTPURLResponse else {
+                 if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': Invalid response type.") }
+                 completion(false); return
             }
-            
-            // Check for valid data
-            guard let data = data else {
+            // Check Status Code (Handle 404 gracefully)
+            guard httpResponse.statusCode == 200 || httpResponse.statusCode == 404 else {
                 if self.debugLogsEnabled {
-                    print("❌ Sync failed for '\(screenName)': No data received.")
+                    print("❌ Sync failed for '\(screenName)': HTTP status code \(httpResponse.statusCode)")
+                    if let data = data, let responseBody = String(data: data, encoding: .utf8) { print("   Response Body: \(responseBody)") }
                 }
-                completion(false)
-                return
+                completion(false); return
             }
-            
-            // Parse JSON response
+             if httpResponse.statusCode == 404 {
+                 if self.debugLogsEnabled { print("ℹ️ Sync info for '\(screenName)': No published translations found.") }
+                 completion(true); return
+             }
+
+            // Validate and Parse Response Data
+             guard let data = data else {
+                if self.debugLogsEnabled { print("❌ Sync failed for '\(screenName)': No data received.") }
+                completion(false); return
+            }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let keys = json["keys"] as? [[String: Any]] else {
                 if self.debugLogsEnabled {
                     print("❌ Sync failed for '\(screenName)': Failed to parse JSON response.")
                     print("   Raw response:", String(data: data, encoding: .utf8) ?? "nil")
                 }
-                completion(false)
-                return
+                completion(false); return
             }
-            
-            // --- Update Cache Synchronously ---
-            self.cacheQueue.async(flags: .barrier) { // Use barrier for safety if queue becomes concurrent
+
+            // --- Update Cache and Persistence (Thread-Safe Write) ---
+            self.cacheQueue.async { // Use async for cache update
                 var updatedTabValuesForCurrentLang: [String: String] = [:]
-                var newCacheForScreen: [String: [String: String]] = [:]
-                let currentLang = self.currentLanguage // Read language inside sync block
-                
+                var newCacheForScreen: [String: [String: String]] = self.cache[screenName] ?? [:]
+                let currentLang = self.currentLanguage
+
                 for item in keys {
-                    if let k = item["key"] as? String,
-                       let values = item["values"] as? [String: String] {
-                        
-                        newCacheForScreen[k] = values // Store all language values for the key
-                        
-                        if let v = values[currentLang] {
-                            updatedTabValuesForCurrentLang[k] = v // Store value for current language
-                        }
-                        
-                        if self.debugLogsEnabled {
-                           // print("📝 Updated cache[\(screenName)][\(k)] = \(values)") // Log all languages if needed
-                        }
+                    if let k = item["key"] as? String, let values = item["values"] as? [String: String] {
+                        newCacheForScreen[k] = values
+                        if let v = values[currentLang] { updatedTabValuesForCurrentLang[k] = v }
                     }
                 }
-                
-                // Replace the entire entry for the screenName
                 self.cache[screenName] = newCacheForScreen
-                
-                // Add screen name to offline list
-                 if !self.offlineTabList.contains(screenName) {
-                     self.offlineTabList.append(screenName)
-                 }
+                if !self.offlineTabList.contains(screenName) { self.offlineTabList.append(screenName) } // Use offlineTabList
 
-                // Save updated cache and tab list to disk
-                self.saveCacheToDisk() // Call within the queue after modification
+                self.saveCacheToDisk()
                 self.saveOfflineTabListToDisk() // Save updated tabs list
 
-                // --- Dispatch UI Updates to Main Thread ---
                 DispatchQueue.main.async {
-                    // Notify specific handler for this screen
-                    self.translationUpdateHandlers[screenName]?(updatedTabValuesForCurrentLang)
-                    
-                    // Post general notification for SwiftUI views or other listeners
-                    self.postTranslationsUpdatedNotification(screenName: screenName)
-                    
-                    if self.debugLogsEnabled {
-                        print("✅ Synced translations for \(screenName)") // Log count: \(updatedTabValuesForCurrentLang.count) keys")
-                    }
-                    completion(true) // Call completion *after* potential UI updates are dispatched
+                    self.notifyUpdateHandlers(screenName: screenName, values: updatedTabValuesForCurrentLang)
+                    if self.debugLogsEnabled { print("✅ Synced translations for \(screenName)") }
+                    completion(true)
                 }
-            } // End cacheQueue.async
-            
+            } // End cacheQueue async
         }.resume()
     }
-    
-    /// Checks if the content is outdated based on `lastSyncCheck` and triggers sync if needed.
+
+
+    /// Triggers sync for all known project tabs plus special tabs.
     private func syncIfOutdated() {
-        // Add logic here if needed to check lastSyncCheck against pollingInterval
-        // For now, it syncs all known tabs unconditionally when called.
-        
         // Get list of tabs to sync (combine cached and offline lists)
         let tabsToSync = cacheQueue.sync {
-             Array(Set(self.cache.keys).union(Set(self.offlineTabList))).filter { !$0.starts(with: "__") } // Exclude special tabs like __colors__ initially
+             Array(Set(self.cache.keys).union(Set(self.offlineTabList))).filter { !$0.starts(with: "__") }
         }
-        let specialTabs = ["__colors__", "__images__"] // Sync special tabs always or based on separate logic
-        
-        if debugLogsEnabled {
-             print("🔄 Syncing tabs: \(tabsToSync.joined(separator: ", ")), \(specialTabs.joined(separator: ", "))")
+        let specialTabs = ["__colors__", "__images__"] // Sync special tabs based on original logic
+
+        let allTabs = tabsToSync + specialTabs
+        if debugLogsEnabled && !allTabs.isEmpty {
+             print("🔄 Syncing tabs on app active/poll: \(allTabs.joined(separator: ", "))")
         }
-        
-        for tab in tabsToSync + specialTabs {
+
+        // Check if authenticated (has secrets needed for encryption)
+        var secretsAvailable: Bool = false
+        cacheQueue.sync { secretsAvailable = self.symmetricKey != nil && !self.projectSecret.isEmpty }
+        guard secretsAvailable else {
+            if debugLogsEnabled { print("ℹ️ Skipping sync: Missing secrets/keys.") }
+            return
+        }
+
+        // Trigger sync for each tab concurrently
+        for tab in allTabs {
             self.sync(screenName: tab) { success in
-                // Completion is handled within sync now (posts notification)
                 if !success && self.debugLogsEnabled {
                      print("⚠️ Failed to sync tab '\(tab)' during periodic/app-active sync.")
                 }
             }
         }
     }
-    
-    // MARK: - Socket Communication
-    
+
+    // MARK: - Socket Communication (Original Handshake Method)
+
     /// Establishes connection with the Socket.IO server.
-    public func connectSocket(apiKey: String, projectId: String) {
-        // Check existing status safely
-        guard socket?.status != .connected && socket?.status != .connecting else {
-            if self.debugLogsEnabled {
-                print("⚠️ Socket already connected or connecting — skipping reinitialization.")
-            }
+    public func connectSocket() { // Removed parameters as they weren't used in original call path
+        // Read project ID safely
+        var currentProjectId: String?
+        cacheQueue.sync { currentProjectId = self.readProjectIdFromConfig() }
+
+        guard let projectId = currentProjectId else {
+            if self.debugLogsEnabled { print("ℹ️ Socket connection deferred: Missing project ID.") }
             return
         }
-        
-        guard let url = URL(string: serverUrl) else {
-             if self.debugLogsEnabled { print("❌ Invalid socket URL.") }
-             return
-        }
-        
-        // Ensure manager and socket are created if nil
-        if manager == nil || socket == nil {
-             manager = SocketManager(socketURL: url, config: [.log(debugLogsEnabled), .compress, .reconnects(true), .reconnectAttempts(-1), .reconnectWait(3), .reconnectWaitMax(10)])
-             socket = manager?.defaultSocket
-             setupSocketHandlers(projectId: projectId) // Setup handlers only once
-        }
 
-        if self.debugLogsEnabled {
-            print("🔌 Attempting to connect socket...")
-        }
-        socket?.connect()
-    }
-    
-    /// Sets up the event handlers for the Socket.IO client.
-    private func setupSocketHandlers(projectId: String) {
-        socket?.on(clientEvent: .connect) { [weak self] data, ack in
-            guard let self = self else { return }
-            if self.debugLogsEnabled {
-                print("🟢 Socket connected")
-            }
-            // Send handshake immediately after connection
-            self.sendHandshake(projectId: projectId)
-        }
-        
-        socket?.on("handshake_ack") { [weak self] data, ack in
-             guard let self = self else { return }
-            if self.debugLogsEnabled {
-                print("🤝 Handshake acknowledged by server.")
-            }
-            // Sync content after successful handshake
-            self.syncIfOutdated()
-        }
-        
-        socket?.on("translationsUpdated") { [weak self] data, ack in
-             guard let self = self else { return }
-            if self.debugLogsEnabled {
-                 print("📡 Socket update received: \(data)")
-            }
-            self.handleSocketTranslationUpdate(data: data)
-        }
-        
-        socket?.on(clientEvent: .disconnect) { [weak self] data, ack in
-             guard let self = self else { return }
-            if self.debugLogsEnabled {
-                print("🔌 Socket disconnected. Reason: \(data)")
-            }
-        }
-        
-        socket?.on(clientEvent: .error) { [weak self] data, _ in
-             guard let self = self else { return }
-            if self.debugLogsEnabled {
-                // Data often contains an Error object
-                 if let error = data.first as? Error {
-                     print("❌ Socket error: \(error.localizedDescription)")
-                 } else {
-                     print("❌ Socket error: \(data)")
-                 }
-            }
-        }
-        
-        socket?.on(clientEvent: .reconnect) { [weak self] data, _ in
-             guard let self = self else { return }
-             if self.debugLogsEnabled { print("🔁 Socket reconnected.") }
-             // Re-send handshake on successful reconnect
-             self.sendHandshake(projectId: projectId)
-        }
-        
-        socket?.on(clientEvent: .reconnectAttempt) { [weak self] data, _ in
-             guard let self = self else { return }
-             // Data usually contains reconnect attempt number and delay
-             if self.debugLogsEnabled { print("🔁 Attempting socket reconnect... \(data)") }
-        }
-        
-        // Handle status changes if needed
-        socket?.on(clientEvent: .statusChange) { [weak self] data, _ in
-             guard let self = self else { return }
-             if self.debugLogsEnabled { print("ℹ️ Socket status changed: \(self.socket?.status.description ?? "Unknown")") }
-        }
-    }
-
-    /// Sends the encrypted handshake message to the server.
-    private func sendHandshake(projectId: String) {
-         // Encrypt body synchronously
-         let encryptedPayload = cacheQueue.sync {
-             let body = ["projectId": projectId]
-             return self.encryptBody(body)
-         }
-
-         guard let encryptedData = encryptedPayload,
-               var sealed = try? JSONSerialization.jsonObject(with: encryptedData, options: []) as? [String: Any] else {
-             if self.debugLogsEnabled { print("❌ Failed to encrypt handshake payload, sending plain.") }
-             // Fallback to sending plain projectId if encryption fails
-             self.socket?.emit("handshake", ["projectId": projectId])
-             return
-         }
-
-         // Add projectId plain text alongside encrypted data if required by backend
-         sealed["projectId"] = projectId
-         if self.debugLogsEnabled { print("🤝 Sending handshake: \(sealed)") }
-         self.socket?.emit("handshake", sealed)
-
-         // Optional: Add a timeout for handshake acknowledgement
-         // ...
-    }
-    
-    /// Handles incoming translation update messages from the socket.
-    private func handleSocketTranslationUpdate(data: [Any]) {
-        guard let dict = data.first as? [String: Any],
-              let screenName = dict["screenName"] as? String else {
-            if self.debugLogsEnabled {
-                print("⚠️ Invalid socket data format received: \(data)")
-            }
-            return
-        }
-        
-        if self.debugLogsEnabled {
-            print("📡 Processing socket update for tab: \(screenName)")
-        }
-        
-        // If update is for all screens, trigger sync for all known tabs
-        if screenName == "__ALL__" {
-            if self.debugLogsEnabled { print("🔄 Socket requested sync for __ALL__ tabs.") }
-            self.syncIfOutdated() // Sync all relevant tabs
-            return
-        }
-        
-        // Otherwise, sync the specific screen mentioned
-        self.sync(screenName: screenName) { success in
-            // Completion/notification is handled within sync now
-            if !success && self.debugLogsEnabled {
-                print("❌ Failed to refresh tab '\(screenName)' after socket update signal.")
-            }
-        }
-    }
-    
-    /// Attempts to start the socket connection using saved config.
-    public func startListening() {
-        // Read config synchronously
-        guard let config = readConfig(),
-              let projectId = config["projectId"],
-              let token = config["authToken"], // Token might not be needed for connect, but good to check
-              let secret = config["projectSecret"]
-        else {
-            if self.debugLogsEnabled {
-                print("ℹ️ No saved config found or config incomplete. Socket connection deferred until authentication.")
-            }
-            return
-        }
-        
-        // Ensure secret is set for potential handshake encryption
-        setAPISecret(secret)
-        
-        // Connect socket using loaded projectId
-        connectSocket(apiKey: "", projectId: projectId) // apiKey might not be needed here if already authenticated
-    }
-    
-    /// Disconnects the socket.
-    public func stopListening() {
-        socket?.disconnect()
-        // Don't nil out manager/socket immediately if using auto-reconnect
-        if self.debugLogsEnabled {
-            print("🔌 Socket disconnect requested.")
-        }
-    }
-    
-    /// Checks if the socket is currently connected.
-    public func isConnected() -> Bool {
-        return socket?.status == .connected
-    }
-    
-    // MARK: - Authentication
-    
-    /// Authenticates the SDK with the backend using API keys.
-    /// Saves configuration on success and initiates socket connection.
-    public func authenticate(apiKey: String, projectId: String, projectSecret: String, completion: @escaping (Bool) -> Void) {
-        
-        // Set the secret immediately for encryption
-        setAPISecret(projectSecret)
-        
-        guard let url = URL(string: "\(serverUrl)/api/sdk/auth?projectId=\(projectId)") else {
-             if self.debugLogsEnabled { print("❌ Auth failed: Invalid URL.") }
-             completion(false)
-             return
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 15 // Add timeout
-        
-        // Prepare body and signature (reads symmetricKey synchronously)
-        let (encryptedBody, signature) = cacheQueue.sync { () -> (Data?, String?) in
-            let bodyDict = ["apiKey": apiKey, "projectId": projectId, "projectSecret": projectSecret] // Include secret if backend expects it
-            let encrypted = self.encryptBody(bodyDict)
-            var sig: String? = nil
-            if let bodyData = encrypted, let key = self.symmetricKey {
-                let hmac = HMAC<SHA256>.authenticationCode(for: bodyData, using: key)
-                sig = Data(hmac).base64EncodedString()
-            }
-             if self.debugLogsEnabled {
-                 print("🛡️ Auth Body Payload (Plain):", bodyDict)
-                 if let encoded = encrypted {
-                     print("📦 Encoded Auth Body:", String(data: encoded, encoding: .utf8) ?? "invalid")
-                 } else {
-                     print("❌ Failed to encode auth body")
-                 }
-             }
-            return (encrypted, sig)
-        }
-        
-        guard let finalEncryptedBody = encryptedBody else {
-            if self.debugLogsEnabled {
-                print("❌ Auth failed: Encryption returned nil.")
-            }
-            completion(false)
-            return
-        }
-        
-        request.httpBody = finalEncryptedBody
-        if let finalSignature = signature {
-            request.setValue(finalSignature, forHTTPHeaderField: "X-Signature")
-        } else if self.debugLogsEnabled {
-             print("⚠️ Auth warning: Could not generate signature (symmetric key missing?).")
-        }
-        
-        // Perform network request
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                if self.debugLogsEnabled { print("❌ Auth failed: Network error - \(error.localizedDescription)") }
-                completion(false)
+        // Perform on main thread if SocketManager requires it
+        DispatchQueue.main.async {
+            // Check existing status
+            let currentStatus = self.manager?.status ?? .notConnected
+            guard currentStatus != .connected && currentStatus != .connecting else {
+                if self.debugLogsEnabled { print("⚠️ Socket already connected or connecting.") }
+                if currentStatus == .connected && !self.handshakeAcknowledged { self.sendHandshake(projectId: projectId) }
                 return
             }
-            
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                if self.debugLogsEnabled {
-                    print("❌ Auth failed: HTTP status code \(statusCode)")
-                     if let data = data, let responseBody = String(data: data, encoding: .utf8) {
-                        print("   Response Body: \(responseBody)")
-                    }
-                }
-                completion(false)
-                return
-            }
-            
-            guard let data = data,
-                  let result = try? JSONDecoder().decode(AuthResult.self, from: data),
-                  let token = result.token else {
-                if self.debugLogsEnabled {
-                    print("❌ Auth failed: Decoding failed or token missing.")
-                    print("   Raw response:", String(data: data ?? Data(), encoding: .utf8) ?? "nil")
-                }
-                completion(false)
-                return
-            }
-            
-            // Authentication successful, save config
-            let config: [String: String] = [
-                "projectId": projectId,
-                "authToken": token,
-                "projectSecret": projectSecret // Save secret to derive key later
-            ]
-            
-            if self.saveConfig(config) {
-                if self.debugLogsEnabled {
-                    print("✅ Authenticated successfully.")
-                }
-                // Update internal state and connect socket
-                self.cacheQueue.async { self.projectSecret = projectSecret } // Update internal secret
-                self.connectSocket(apiKey: apiKey, projectId: projectId)
-                completion(true)
-            } else {
-                // Failed to save config
-                completion(false)
-            }
-        }.resume()
-    }
-    
-    /// Retrieves the image URL string for a given key and screen name in the current language.
-    /// Returns nil if the key, screen, or language value is not found or not a valid URL string.
-    public func imageUrl(for key: String, inTab screenName: String) -> URL? {
-        // Use the existing thread-safe translation method to get the URL string
-        let urlString = self.translation(for: key, inTab: screenName) // Re-use translation logic
 
-        guard !urlString.isEmpty else {
-            if self.debugLogsEnabled {
-                print("⚠️ Image URL string not found for key '\(key)' in tab '\(screenName)' (Lang: \(getLanguage()))")
-            }
-            return nil
-        }
-
-        guard let url = URL(string: urlString) else {
-             if self.debugLogsEnabled {
-                print("❌ Invalid URL format for key '\(key)' in tab '\(screenName)': \(urlString)")
-            }
-            return nil
-        }
-        
-        if self.debugLogsEnabled {
-            // print("🖼️ Resolved image URL for '\(key)'/\(screenName)': \(url)") // Can be noisy
-        }
-        return url
-    }
-    
-    // MARK: - Update Handling & Notifications
-    
-    /// Registers a handler to be called when translations for a specific screen are updated.
-    public func onTranslationsUpdated(for screenName: String, handler: @escaping ([String: String]) -> Void) {
-        // No direct cache access, safe to call from any thread.
-        // The handler itself will be called on the main thread from sync/setLanguage.
-        self.translationUpdateHandlers[screenName] = handler
-        
-        // Immediately provide current cached values if available
-        let currentValues = self.getCachedTranslations(for: screenName, language: self.getLanguage())
-        if !currentValues.isEmpty {
-             DispatchQueue.main.async {
-                 handler(currentValues)
-             }
-        }
-    }
-    
-    /// Posts the .translationsUpdated notification and updates the bridge.
-    private func postTranslationsUpdatedNotification(screenName: String) {
-        // Ensure this is called on the main thread as it triggers UI updates
-        assert(Thread.isMainThread, "Must be called on the main thread")
-        
-        CureTranslationBridge.shared.refreshToken = UUID() // Update bridge for SwiftUI views
-        NotificationCenter.default.post(name: .translationsUpdated, object: nil, userInfo: [
-            "screenName": screenName
-        ])
-        if debugLogsEnabled {
-             // print("📬 Posted .translationsUpdated notification for '\(screenName)'")
-        }
-    }
-
-    /// Calls the registered update handlers for a given screen name.
-    private func notifyUpdateHandlers(screenName: String, values: [String: String]) {
-         // Ensure this is called on the main thread
-         assert(Thread.isMainThread, "Must be called on the main thread")
-         self.translationUpdateHandlers[screenName]?(values)
-         self.postTranslationsUpdatedNotification(screenName: screenName) // Also post general notification
-    }
-    
-    // MARK: - Persistence (Cache & Config)
-    
-    /// Saves the current in-memory cache to disk. MUST be called from within `cacheQueue`.
-    private func saveCacheToDisk() {
-        // This method assumes it's already running within cacheQueue.sync or cacheQueue.async
-        do {
-            // Cache is already accessed synchronously, no need to sanitize here again if writes are safe
-            let data = try JSONEncoder().encode(self.cache) // Use JSONEncoder for Codable types if possible
-            // let data = try JSONSerialization.data(withJSONObject: self.cache, options: []) // Use if not Codable
-            try data.write(to: self.cacheFilePath, options: .atomic)
-            if self.debugLogsEnabled {
-                // print("💾 Saved cache to disk.")
-            }
-        } catch {
-            if self.debugLogsEnabled {
-                print("❌ Failed to save cache: \(error)")
-            }
-        }
-    }
-    
-    /// Loads the cache from disk during initialization.
-    private func loadCacheFromDisk() {
-        // This runs at init time, before concurrent access starts, so direct access is safe here.
-        guard FileManager.default.fileExists(atPath: self.cacheFilePath.path) else {
-            if self.debugLogsEnabled {
-                print("ℹ️ No cache file found at startup.")
-            }
-            return
-        }
-        
-        do {
-            let data = try Data(contentsOf: self.cacheFilePath)
-            // Use JSONDecoder if cache structure is simple enough or conforms to Codable
-            if let loadedCache = try? JSONDecoder().decode([String: [String: [String: String]]].self, from: data) {
-                 self.cache = loadedCache
-                 if self.debugLogsEnabled {
-                     print("📦 Loaded cache from disk with tabs: \(self.cache.keys.joined(separator: ", "))")
-                 }
-            } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: [String: [String: String]]] {
-                // Fallback to JSONSerialization if Decoder fails or not applicable
-                self.cache = json
-                if self.debugLogsEnabled {
-                    print("📦 Loaded cache via JSONSerialization with tabs: \(self.cache.keys.joined(separator: ", "))")
-                }
-            } else {
-                 if self.debugLogsEnabled { print("⚠️ Failed to decode cache data from disk.") }
-                 // Consider deleting the corrupted cache file
-                 try? FileManager.default.removeItem(at: self.cacheFilePath)
+            // Validate socket URL using socketIOURL
+            guard let url = URL(string: self.socketIOURL) else {
+                 if self.debugLogsEnabled { print("❌ Invalid socket URL: \(self.socketIOURL)") }
                  return
             }
 
-            // Load offline tab list
-            loadOfflineTabListFromDisk() // Load the list of known tabs
+            // Configure SocketManager (no specific auth params needed here for original handshake)
+            let socketConfig: SocketIOClientConfiguration = [
+                .log(self.debugLogsEnabled), .compress, .reconnects(true), .reconnectAttempts(-1),
+                .reconnectWait(3), .reconnectWaitMax(10), .forceWebsockets(true)
+            ]
 
-            // Initial UI update after loading cache (do this after setting up listeners if needed)
-            // This might be too early if called from init before UI is ready.
-            // Consider triggering initial updates after authentication or first sync.
-            /*
-             DispatchQueue.main.async {
-                 for tab in self.cache.keys {
-                     self.postTranslationsUpdatedNotification(screenName: tab)
-                 }
-             }
-             */
-            
-        } catch {
-            if self.debugLogsEnabled {
-                print("❌ Failed to load cache from disk: \(error)")
+            // Disconnect old manager and create a new one
+            self.manager?.disconnect()
+            if self.debugLogsEnabled { print("🔌 Creating new SocketManager for \(url)...") }
+            self.manager = SocketManager(socketURL: url, config: socketConfig)
+
+            guard let currentManager = self.manager else {
+                 if self.debugLogsEnabled { print("❌ Failed to create SocketManager.") }
+                 return
             }
-             // Attempt to delete corrupted cache file
-             try? FileManager.default.removeItem(at: self.cacheFilePath)
+
+            self.socket = currentManager.defaultSocket
+            if self.debugLogsEnabled { print("🔌 Attempting socket connect()...") }
+            self.setupSocketHandlers(projectId: projectId) // Attach event handlers
+            self.socket?.connect() // Initiate connection
         }
     }
 
-     /// Saves the list of known tabs (including offline ones) to disk. MUST be called from within `cacheQueue`.
-     private func saveOfflineTabListToDisk() {
-         // Assumes running within cacheQueue
-         let tabListPath = self.cacheFilePath.deletingLastPathComponent().appendingPathComponent("tabs.json")
-         do {
-             let data = try JSONEncoder().encode(self.offlineTabList)
-             try data.write(to: tabListPath, options: .atomic)
-             if debugLogsEnabled {
-                 // print("💾 Saved offline tab list: \(self.offlineTabList)")
-             }
-         } catch {
-             if debugLogsEnabled {
-                 print("❌ Failed to save offline tab list: \(error)")
-             }
-         }
-     }
 
-     /// Loads the list of known tabs from disk. Called during init.
-     private func loadOfflineTabListFromDisk() {
-         // Safe to call during init
-         let tabListPath = self.cacheFilePath.deletingLastPathComponent().appendingPathComponent("tabs.json")
-         guard FileManager.default.fileExists(atPath: tabListPath.path) else { return }
+    /// Sets up the event handlers (listeners) for the Socket.IO client.
+    private func setupSocketHandlers(projectId: String) {
+        guard let currentSocket = socket else {
+            if debugLogsEnabled { print("❌ setupSocketHandlers: Socket instance is nil.") }
+            return
+        }
+         if debugLogsEnabled { print("👂 Setting up socket handlers for socket ID: \(currentSocket.sid ?? "N/A") (nsp: \(currentSocket.nsp))") }
 
-         do {
-             let data = try Data(contentsOf: tabListPath)
-             self.offlineTabList = try JSONDecoder().decode([String].self, from: data)
-             if debugLogsEnabled {
-                 print("📦 Loaded offline tab list: \(self.offlineTabList)")
-             }
-         } catch {
-             if debugLogsEnabled {
-                 print("❌ Failed to load offline tab list: \(error)")
-             }
-             try? FileManager.default.removeItem(at: tabListPath) // Remove corrupted file
-         }
-     }
-    
-    /// Saves the authentication configuration to disk.
-    private func saveConfig(_ config: [String: String]) -> Bool {
-        // File operations are generally safe but can block, consider background if needed
-        do {
-            let configDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
-            try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true, attributes: nil)
-            let configFilePath = configDir.appendingPathComponent("config.json")
-            let jsonData = try JSONSerialization.data(withJSONObject: config, options: .prettyPrinted)
-            try jsonData.write(to: configFilePath, options: .atomic)
-            if self.debugLogsEnabled {
-                print("💾 Saved config to \(configFilePath.path)")
-            }
-            return true
-        } catch {
-            if self.debugLogsEnabled {
-                print("❌ Failed to save config: \(error)")
-            }
-            return false
+        // Remove existing handlers first
+        currentSocket.off(clientEvent: .connect)
+        currentSocket.off("handshake_ack") // Listen for custom ack
+        currentSocket.off("translationsUpdated")
+        currentSocket.off(clientEvent: .disconnect)
+        currentSocket.off(clientEvent: .error)
+        currentSocket.off(clientEvent: .reconnect)
+        currentSocket.off(clientEvent: .reconnectAttempt)
+        currentSocket.off(clientEvent: .statusChange)
+
+        // --- Handlers for Original Flow ---
+        currentSocket.on(clientEvent: .connect) { [weak self] data, ack in
+             guard let self = self else { return }
+            if self.debugLogsEnabled { print("🟢✅ Socket connect handler fired! SID: \(self.socket?.sid ?? "N/A")") }
+            // Reset handshake status and send handshake
+            self.cacheQueue.async { self.handshakeAcknowledged = false } // Use async non-barrier
+            self.sendHandshake(projectId: projectId)
         }
-    }
-    
-    /// Reads the authentication configuration from disk.
-    private func readConfig() -> [String: String]? {
-        let configDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
-        let configFilePath = configDir.appendingPathComponent("config.json")
-        
-        guard FileManager.default.fileExists(atPath: configFilePath.path),
-              let data = try? Data(contentsOf: configFilePath),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            return nil
-        }
-        return json
-    }
-    
-    /// Reads the auth token from the saved config file.
-    private func readTokenFromConfig() -> String? {
-        return readConfig()?["authToken"]
-    }
-    
-    /// Reads the project ID from the saved config file.
-    private func readProjectIdFromConfig() -> String? {
-        return readConfig()?["projectId"]
-    }
-    
-    /// Reads the project secret from the saved config file.
-    private func readProjectSecretFromConfig() -> String? {
-        return readConfig()?["projectSecret"]
-    }
-    
-    // MARK: - Background Handling & Polling
-    
-    /// Sets up observers for app lifecycle events and polling timer.
-    private func observeAppActiveNotification() {
-#if canImport(UIKit) && !os(watchOS) // Ensure UIKit is available and not watchOS
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
-#endif
-        // Add equivalent observers for AppKit (macOS) or other platforms if needed
-    }
-    
-    @objc private func appDidBecomeActive() {
-        if self.debugLogsEnabled {
-            print("📲 App became active — checking for outdated content & socket status.")
-        }
-        // Ensure socket is connected or attempts to connect
-        startListening() // This will attempt connection if config exists and not connected
-        // Trigger sync
-        syncIfOutdated()
-    }
-    
-    private func setupPollingTimer() {
-        // Invalidate existing timer first
-        pollingTimer?.invalidate()
-        // Schedule new timer
-        pollingTimer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in
+
+        // Listen for the custom handshake acknowledgement
+        currentSocket.on("handshake_ack") { [weak self] data, ack in
             guard let self = self else { return }
-            if self.debugLogsEnabled {
-                print("⏰ Polling timer fired — syncing content.")
-            }
-            // Perform sync
+            if self.debugLogsEnabled { print("🤝 Handshake acknowledged by server.") }
+            self.cacheQueue.async { self.handshakeAcknowledged = true } // Use async non-barrier
+            // Trigger sync after successful handshake
             self.syncIfOutdated()
         }
-         if debugLogsEnabled {
-             print("⏱️ Polling timer setup with interval: \(pollingInterval) seconds.")
+
+        currentSocket.on("translationsUpdated") { [weak self] data, ack in
+             guard let self = self else { return }
+            print(">>> DEBUG: Received 'translationsUpdated' event from server. Data: \(data)")
+            if self.debugLogsEnabled { print("📡 Socket update received: \(data)") }
+            self.handleSocketTranslationUpdate(data: data)
+        }
+
+        currentSocket.on(clientEvent: .disconnect) { [weak self] data, ack in
+             guard let self = self else { return }
+             if self.debugLogsEnabled { print("🔌 Socket disconnected. Reason: \(data)") }
+             // Reset handshake status on disconnect
+             self.cacheQueue.async { self.handshakeAcknowledged = false }
+        }
+
+        currentSocket.on(clientEvent: .error) { [weak self] data, _ in
+             guard let self = self else { return }
+             if let error = data.first as? Error { print("❌ Socket error: \(error.localizedDescription)") }
+             else { print("❌ Socket error: \(data)") }
+             // Reset handshake status on error? Maybe not, depends on error type.
+             // self.cacheQueue.async { self.handshakeAcknowledged = false }
+        }
+
+        currentSocket.on(clientEvent: .reconnect) { [weak self] data, _ in
+             guard let self = self else { return }
+             if self.debugLogsEnabled { print("🔁 Socket reconnected. Data: \(data)") }
+             // Connect handler will fire again, triggering handshake.
+        }
+
+        currentSocket.on(clientEvent: .reconnectAttempt) { [weak self] data, _ in
+             guard let self = self else { return }
+             if self.debugLogsEnabled { print("🔁 Attempting socket reconnect... \(data)") }
+             // Reset handshake status before attempting reconnect
+             self.cacheQueue.async { self.handshakeAcknowledged = false }
+        }
+
+        currentSocket.on(clientEvent: .statusChange) { [weak self] data, _ in
+             guard let self = self else { return }
+             if self.debugLogsEnabled { print("ℹ️ Socket status changed: \(self.socket?.status.description ?? "Unknown")") }
+        }
+
+        if debugLogsEnabled { print("👂✅ Socket handlers setup complete for socket ID: \(currentSocket.sid ?? "N/A")") }
+    }
+
+    /// Sends the encrypted handshake message to the server using projectSecret.
+    private func sendHandshake(projectId: String) {
+         // Read projectSecret safely
+         var secretToSend: String?
+         cacheQueue.sync { secretToSend = self.projectSecret }
+
+         guard let secret = secretToSend, !secret.isEmpty else {
+             if debugLogsEnabled { print("❌ Cannot send handshake: Project secret not available.") }
+             return
+         }
+
+         // Encrypt body containing projectId using projectSecret
+         let encryptedPayload = cacheQueue.sync { () -> Data? in
+             // Derive key from projectSecret specifically for handshake
+             guard let secretData = secret.data(using: .utf8) else { return nil }
+             let handshakeKey = SymmetricKey(data: SHA256.hash(data: secretData))
+             let body = ["projectId": projectId] // Payload to encrypt
+             guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+             do {
+                 let sealedBox = try AES.GCM.seal(jsonData, using: handshakeKey)
+                 let result: [String: String] = [
+                     "iv": sealedBox.nonce.withUnsafeBytes { Data($0).base64EncodedString() },
+                     "ciphertext": sealedBox.ciphertext.base64EncodedString(),
+                     "tag": sealedBox.tag.base64EncodedString()
+                 ]
+                 return try JSONSerialization.data(withJSONObject: result)
+             } catch {
+                 if debugLogsEnabled { print("❌ Handshake encryption failed: \(error)") }
+                 return nil
+             }
+         }
+
+         guard let encryptedData = encryptedPayload,
+               var sealed = try? JSONSerialization.jsonObject(with: encryptedData, options: []) as? [String: Any] else { // Make sealed mutable
+             if self.debugLogsEnabled { print("❌ Failed to encrypt handshake payload, cannot send.") }
+             // Maybe disconnect or retry?
+             return
+         }
+
+         // Add plain projectId if backend expects it alongside encrypted data
+         sealed["projectId"] = projectId // Add projectId to the dictionary
+
+         if self.debugLogsEnabled { print("🤝 Sending handshake: \(sealed)") }
+         // Ensure socket is valid before emitting
+         DispatchQueue.main.async { // Emit from main thread if required
+             self.socket?.emit("handshake", sealed)
          }
     }
-    
+
+
+    /// Handles incoming 'translationsUpdated' events from the socket.
+    private func handleSocketTranslationUpdate(data: [Any]) {
+        print(">>> DEBUG: handleSocketTranslationUpdate entered. Data: \(data)")
+        guard let dict = data.first as? [String: Any],
+              let screenName = dict["screenName"] as? String else {
+            if self.debugLogsEnabled { print("⚠️ Invalid socket data format received for translationsUpdated: \(data)") }
+            return
+        }
+        if self.debugLogsEnabled { print("📡 Processing socket update for tab: \(screenName)") }
+
+        // Trigger sync based on received screenName
+        if screenName == "__ALL__" {
+            if self.debugLogsEnabled { print("🔄 Socket requested sync for __ALL__ tabs.") }
+            self.syncIfOutdated() // Sync all known tabs
+        } else {
+            // Sync only the specific tab mentioned in the event
+            self.sync(screenName: screenName) { success in
+                if !success && self.debugLogsEnabled {
+                    print("❌ Failed to refresh tab '\(screenName)' after socket update signal.")
+                }
+            }
+        }
+    }
+
+    /// Attempts connection if config exists. Called by app lifecycle events or after auth.
+    public func startListening() {
+        // Read config needed for connection (projectId)
+        var currentProjectId: String?
+        cacheQueue.sync { currentProjectId = self.readProjectIdFromConfig() }
+
+        if currentProjectId != nil {
+            connectSocket() // Call original connectSocket which doesn't require token param
+        } else if debugLogsEnabled {
+            print("ℹ️ startListening: No projectId available, connection deferred.")
+        }
+    }
+
+    /// Disconnects the socket.
+    public func stopListening() {
+        // Perform on main thread if SocketManager requires it
+        DispatchQueue.main.async {
+            self.manager?.disconnect()
+            if self.debugLogsEnabled { print("🔌 Socket disconnect requested.") }
+        }
+    }
+
+    /// Checks if the socket is currently connected.
+    public func isConnected() -> Bool {
+        return manager?.status == .connected
+    }
+
+
+    // MARK: - Authentication (Original Encryption Method)
+
+    /// Authenticates the SDK using the original encryption method.
+    public func authenticate(apiKey: String, projectId: String, projectSecret: String, completion: @escaping (Bool) -> Void) {
+
+        // Store secrets immediately for encryption and handshake
+        self.cacheQueue.async { // Use async, barrier not strictly needed if only writes happen here
+            self.projectSecret = projectSecret
+            // Assume apiSecret is the same as projectSecret for key derivation
+            self.apiSecret = projectSecret
+            if let secretData = projectSecret.data(using: .utf8) {
+                self.symmetricKey = SymmetricKey(data: SHA256.hash(data: secretData))
+                if self.debugLogsEnabled { print("🔑 Symmetric key derived from projectSecret.") }
+            } else {
+                if self.debugLogsEnabled { print("⚠️ Failed to create data from projectSecret string.") }
+                self.symmetricKey = nil
+            }
+        }
+
+        // Construct URL - Use projectId in query param as per original controller
+        guard let url = URL(string: "\(serverUrl)/api/sdk/auth?projectId=\(projectId)") else {
+             if self.debugLogsEnabled { print("❌ Auth failed: Invalid API URL. Base: \(serverUrl)") }
+             completion(false); return
+        }
+
+        // Prepare Request
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+
+        // Prepare Encrypted Body (using derived symmetricKey)
+        // This needs to run after the key derivation has potentially completed.
+        // Using a synchronous fetch from the queue ensures the key is available.
+        let encryptedBody = cacheQueue.sync { () -> Data? in
+            guard self.symmetricKey != nil else {
+                if debugLogsEnabled { print("❌ Auth encryption failed: Symmetric key not ready.") }
+                return nil
+            }
+            // Payload for encryption (as expected by original backend controller)
+            let bodyDict: [String: String] = ["apiKey": apiKey, "projectId": projectId] // Removed projectSecret from here
+            return self.encryptBody(bodyDict) // Use helper
+        }
+
+        guard let finalEncryptedBody = encryptedBody else {
+            if self.debugLogsEnabled { print("❌ Auth failed: Failed to encrypt request body.") }
+            completion(false); return
+        }
+        request.httpBody = finalEncryptedBody
+
+        // Add signature header (optional, depends on original backend)
+        // let signature = cacheQueue.sync { ... generate signature ... }
+        // if let sig = signature { request.setValue(sig, forHTTPHeaderField: "X-Signature") }
+
+        if debugLogsEnabled { print("🔑 Authenticating with Project ID: \(projectId) (Using Encryption)...") }
+
+        // Perform Network Request
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            // Handle network error
+            if let error = error {
+                if self.debugLogsEnabled { print("❌ Auth failed: Network error - \(error.localizedDescription)") }
+                DispatchQueue.main.async { completion(false) }; return
+            }
+            // Check response type
+            guard let httpResponse = response as? HTTPURLResponse else {
+                 if self.debugLogsEnabled { print("❌ Auth failed: Invalid response.") }
+                 DispatchQueue.main.async { completion(false) }; return
+            }
+            // Check status code (expect 200 for success)
+            guard httpResponse.statusCode == 200 else {
+                if self.debugLogsEnabled {
+                    print("❌ Auth failed: HTTP status code \(httpResponse.statusCode)")
+                     if let data = data, let responseBody = String(data: data, encoding: .utf8) { print("   Response Body: \(responseBody)") }
+                }
+                DispatchQueue.main.async { completion(false) }; return
+            }
+            // Decode response (Original backend returned token, userId, projectId, projectSecret)
+            // Also expect 'tabs' now based on updated original backend logic
+            guard let data = data,
+                  let result = try? JSONDecoder().decode(AuthResult_OriginalWithTabs.self, from: data),
+                  let receivedToken = result.token,
+                  let receivedProjectId = result.projectId,
+                  let receivedProjectSecret = result.projectSecret
+            else {
+                if self.debugLogsEnabled {
+                    print("❌ Auth failed: Decoding failed or essential fields missing.")
+                    print("   Raw response:", String(data: data ?? Data(), encoding: .utf8) ?? "nil")
+                }
+                DispatchQueue.main.async { completion(false) }; return
+            }
+
+            // --- Authentication successful ---
+            let receivedTabs = result.tabs ?? [] // Get tabs if available
+
+            // Prepare config to save (includes received token and received secret)
+            let config: [String: String] = [
+                "projectId": receivedProjectId,
+                "authToken": receivedToken,
+                "projectSecret": receivedProjectSecret
+                // apiSecret is no longer needed if derived from projectSecret
+            ]
+
+            // Update internal state and save config/tabs (Thread-Safe Write)
+            self.cacheQueue.async { // Use async, ensure completion handler runs after this block
+                // Update in-memory state
+                self.projectSecret = receivedProjectSecret // Update with value from server
+                self.authToken = receivedToken
+                self.knownProjectTabs = Set(receivedTabs) // Store tabs list
+
+                // Persist config and tabs to disk
+                let configSaved = self.saveConfig(config)
+                self.saveOfflineTabListToDisk() // Save tabs list using correct function name
+
+                // Dispatch back to main thread
+                DispatchQueue.main.async {
+                    if self.debugLogsEnabled { print("✅ Authenticated successfully (Original Method). Token received. Known Tabs: \(receivedTabs)") }
+                    // Trigger socket connection and initial sync
+                    self.connectSocket() // Uses original handshake logic
+                    self.syncIfOutdated()
+                    completion(configSaved)
+                }
+            }
+        }.resume()
+    }
+
+
+    // MARK: - Persistence (Cache, Tabs & Config) - Thread-safe implementations
+
+    /// Saves the current in-memory cache to `cache.json`. Assumes running within `cacheQueue`.
+    private func saveCacheToDisk() {
+        let cacheToSave = self.cache // Capture state within queue
+        do {
+            let data = try JSONEncoder().encode(cacheToSave)
+            try data.write(to: self.cacheFilePath, options: .atomic) // Use standard option
+        } catch { if self.debugLogsEnabled { print("❌ Failed to save cache: \(error)") } }
+    }
+
+    /// Loads the cache from `cache.json` during initialization.
+    private func loadCacheFromDisk() {
+        guard FileManager.default.fileExists(atPath: self.cacheFilePath.path) else { return }
+        do {
+            let data = try Data(contentsOf: self.cacheFilePath)
+            if let loadedCache = try? JSONDecoder().decode([String: [String: [String: String]]].self, from: data) {
+                 self.cache = loadedCache
+            } else {
+                if debugLogsEnabled { print("⚠️ Failed to decode cache file, removing.") }
+                try? FileManager.default.removeItem(at: self.cacheFilePath)
+            }
+            // Load offline list after cache load
+            loadOfflineTabListFromDisk()
+        } catch {
+            if debugLogsEnabled { print("❌ Failed to load cache file, removing. Error: \(error)") }
+            try? FileManager.default.removeItem(at: self.cacheFilePath)
+        }
+    }
+
+    /// Saves the list of known project tabs to `tabs.json`. Assumes running within `cacheQueue`.
+    private func saveOfflineTabListToDisk() { // Use original function name
+         let listToSave = self.offlineTabList // Use original variable name
+         do {
+             let data = try JSONEncoder().encode(listToSave)
+             try data.write(to: self.tabsFilePath, options: .atomic) // Use standard option
+             if debugLogsEnabled { /* print("💾 Saved known tabs list: \(listToSave)") */ }
+         } catch { if debugLogsEnabled { print("❌ Failed to save known tabs list: \(error)") } }
+     }
+
+    /// Loads the list of known project tabs from `tabs.json` during initialization.
+    private func loadOfflineTabListFromDisk() { // Use original function name
+         guard FileManager.default.fileExists(atPath: self.tabsFilePath.path) else { return }
+         do {
+             let data = try Data(contentsOf: self.tabsFilePath)
+             self.offlineTabList = try JSONDecoder().decode([String].self, from: data) // Load into original variable
+             // Copy to Set if needed internally, but keep Array for persistence
+             self.knownProjectTabs = Set(self.offlineTabList)
+             if debugLogsEnabled { print("📦 Loaded offline tab list: \(self.offlineTabList)") }
+         } catch {
+             if debugLogsEnabled { print("❌ Failed to load known tabs list, removing. Error: \(error)") }
+             try? FileManager.default.removeItem(at: self.tabsFilePath) // Remove corrupt file
+         }
+     }
+
+    /// Saves the authentication configuration to `config.json`. Assumes running within `cacheQueue`.
+    private func saveConfig(_ config: [String: String]) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: configFilePath.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+            let jsonData = try JSONSerialization.data(withJSONObject: config, options: .prettyPrinted)
+            try jsonData.write(to: self.configFilePath, options: .atomic) // Use standard option
+            if self.debugLogsEnabled { print("💾 Saved config to \(configFilePath.lastPathComponent)") }
+            return true
+        } catch { if self.debugLogsEnabled { print("❌ Failed to save config: \(error)") }; return false }
+    }
+
+    /// Reads the authentication configuration from `config.json`. Safe to call anytime.
+    private func readConfig() -> [String: String]? {
+        guard FileManager.default.fileExists(atPath: configFilePath.path),
+              let data = try? Data(contentsOf: configFilePath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return nil }
+        return json
+    }
+
+    /// Reads the auth token, checking memory first, then optionally disk. Thread-safe.
+    private func readTokenFromConfig(readFromDisk: Bool = true) -> String? {
+        var token: String? = nil
+        cacheQueue.sync { token = self.authToken } // Check memory
+        if token == nil && readFromDisk {
+            token = readConfig()?["authToken"] // Check disk
+            if let loadedToken = token { // Store in memory if loaded from disk
+                cacheQueue.async(flags: .barrier) { self.authToken = loadedToken }
+            }
+        }
+        return token
+    }
+
+    /// Reads the project ID from the saved config file. Safe to call anytime.
+    private func readProjectIdFromConfig(readFromDisk: Bool = true) -> String? {
+        return readConfig()?["projectId"]
+    }
+
+    /// Reads the project secret from the saved config file. Safe to call anytime.
+    private func readProjectSecretFromConfig(readFromDisk: Bool = true) -> String? {
+        return readConfig()?["projectSecret"]
+    }
+
+    /// Clears the saved configuration file (`config.json`).
+    private func clearConfig() {
+         try? FileManager.default.removeItem(at: configFilePath)
+         if debugLogsEnabled { print("🧹 Cleared saved config file.") }
+    }
+
+
+    // MARK: - Background Handling & Polling
+
+    /// Sets up observers for app lifecycle events (main thread).
+    private func observeAppActiveNotification() {
+        #if canImport(UIKit) && !os(watchOS)
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        #endif
+    }
+    /// Called when the app becomes active. Checks socket and triggers sync (main thread).
+    @objc private func appDidBecomeActive() {
+         if self.debugLogsEnabled { print("📲 App became active — checking socket status & content.") }
+         startListening() // Checks config and connects if needed
+         syncIfOutdated() // Checks secrets and syncs if needed
+    }
+    /// Sets up the periodic polling timer (main thread).
+    private func setupPollingTimer() {
+         pollingTimer?.invalidate()
+         pollingTimer = Timer.scheduledTimer(withTimeInterval: pollingInterval, repeats: true) { [weak self] _ in guard let self = self else { return }; if self.debugLogsEnabled { print("⏰ Polling timer fired — syncing content.") }; self.syncIfOutdated() }
+         if debugLogsEnabled { print("⏱️ Polling timer setup with interval: \(pollingInterval) seconds.") }
+    }
+
     // MARK: - Encryption Helper
-    
+
     /// Encrypts the request body using AES.GCM with the derived symmetric key.
     /// MUST be called from within `cacheQueue` to safely access `symmetricKey`.
     private func encryptBody(_ body: [String: Any]) -> Data? {
@@ -1044,9 +954,11 @@ public class CMSCureSDK {
              if debugLogsEnabled { print("❌ Encryption failed: Could not serialize body to JSON.") }
              return nil
         }
-        
+
         do {
+            // Encrypt using AES-GCM
             let sealedBox = try AES.GCM.seal(jsonData, using: symmetricKey)
+            // Combine nonce, ciphertext, and tag into a dictionary for JSON serialization
             let result: [String: String] = [
                 "iv": sealedBox.nonce.withUnsafeBytes { Data($0).base64EncodedString() },
                 "ciphertext": sealedBox.ciphertext.base64EncodedString(),
@@ -1058,284 +970,265 @@ public class CMSCureSDK {
             return nil
         }
     }
-    
-    // MARK: - Deprecated / Utility (Keep if needed)
-    
-    /// Checks if a specific tab has any data in the cache.
-    public func isTabSynced(_ tab: String) -> Bool {
-        // Synchronize read access
-        return cacheQueue.sync { !(cache[tab]?.isEmpty ?? true) }
+
+    // MARK: - Update Handling & Notifications
+
+    /// Registers a handler to be called on the main thread when translations for a specific screen are updated.
+    public func onTranslationsUpdated(for screenName: String, handler: @escaping ([String: String]) -> Void) {
+         DispatchQueue.main.async { // Ensure handler registration and initial call are on main thread
+             self.translationUpdateHandlers[screenName] = handler
+             let currentValues = self.getCachedTranslations(for: screenName, language: self.getLanguage())
+             if !currentValues.isEmpty { handler(currentValues) }
+         }
     }
-    
-    /// Fetches the list of available languages from the server.
+    /// Posts the .translationsUpdated notification and updates the bridge. MUST be called on Main Thread.
+    private func postTranslationsUpdatedNotification(screenName: String) {
+         assert(Thread.isMainThread, "Must be called on the main thread")
+         let newUUID = UUID(); if debugLogsEnabled { print("📬 Posting update notification for '\(screenName)'. New Refresh Token: \(newUUID)") }
+         CureTranslationBridge.shared.refreshToken = newUUID
+         NotificationCenter.default.post(name: .translationsUpdated, object: nil, userInfo: ["screenName": screenName])
+    }
+    /// Calls the registered update handlers for a given screen name. MUST be called on Main Thread.
+    private func notifyUpdateHandlers(screenName: String, values: [String: String]) {
+         assert(Thread.isMainThread, "Must be called on the main thread")
+         if debugLogsEnabled { print("📬 Notifying handlers for '\(screenName)'. Values count: \(values.count)") }
+         self.translationUpdateHandlers[screenName]?(values)
+         self.postTranslationsUpdatedNotification(screenName: screenName) // Also post general notification
+    }
+
+
+    // MARK: - Deprecated / Utility
+
+    /// Checks if a specific tab has any data in the cache. Thread-safe.
+    public func isTabSynced(_ tab: String) -> Bool {
+         return cacheQueue.sync { !(cache[tab]?.isEmpty ?? true) }
+    }
+    /// Fetches the list of available languages from the server using original encryption.
     public func availableLanguages(completion: @escaping ([String]) -> Void) {
-        // Read config synchronously
-        guard let projectId = readProjectIdFromConfig() else {
-            if self.debugLogsEnabled { print("❌ Fetch languages failed: Missing project ID") }
-            completion([])
+        // Read required credentials safely (Keep this part)
+        var currentProjectId: String?
+        cacheQueue.sync { currentProjectId = self.readProjectIdFromConfig() }
+        guard let projectId = currentProjectId else {
+            self.logError("Missing Project ID for availableLanguages") // Add logging
+            self.fallbackToCachedLanguages(completion: completion)
             return
         }
-        
         guard let url = URL(string: "\(serverUrl)/api/sdk/languages/\(projectId)") else {
-             if self.debugLogsEnabled { print("❌ Fetch languages failed: Invalid URL.")}
-             completion([])
-             return
+            self.logError("Invalid URL for availableLanguages: \(serverUrl)/api/sdk/languages/\(projectId)") // Add logging
+            self.fallbackToCachedLanguages(completion: completion)
+            return
         }
-        
+
+        // Prepare request WITHOUT encryption
         var request = URLRequest(url: url)
-        request.httpMethod = "POST" // Should this be GET? Check API design. Assuming POST for consistency.
+        request.httpMethod = "POST" // Or GET if your backend changed it? Verify this. Postman uses POST?
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 10
-        
-        // Prepare body and signature (read symmetricKey synchronously)
-        let (encryptedBody, signature) = cacheQueue.sync { () -> (Data?, String?) in
-            let bodyDict = ["projectId": projectId]
-            let encrypted = self.encryptBody(bodyDict)
-            var sig: String? = nil
-            if let bodyData = encrypted, let key = self.symmetricKey {
-                let hmac = HMAC<SHA256>.authenticationCode(for: bodyData, using: key)
-                sig = Data(hmac).base64EncodedString()
-            }
-            return (encrypted, sig)
+        request.timeoutInterval = 10 // Keep timeout
+
+        // Create the UNENCRYPTED request body
+        let requestBodyDict = ["projectId": projectId] // Simple body, adjust if needed
+        do {
+            let jsonData = try JSONEncoder().encode(requestBodyDict)
+            request.httpBody = jsonData // Set plain JSON data
+        } catch {
+            self.logError("Failed to encode request body for availableLanguages: \(error)") // Add logging
+            self.fallbackToCachedLanguages(completion: completion) // Fallback on encoding error
+            return
         }
-        
-        // Continue only if encryption succeeded (or is not required by backend)
-        request.httpBody = encryptedBody
-        if let finalSignature = signature {
-            request.setValue(finalSignature, forHTTPHeaderField: "X-Signature")
-        }
-        
+
+        // ---- NO ENCRYPTION CALL ----
+        // ---- NO SIGNATURE CALCULATION OR HEADER ----
+
         URLSession.shared.dataTask(with: request) { data, response, error in
+            // 1. Handle Network Error (Keep or improve existing handling)
             if let error = error {
-                if self.debugLogsEnabled { print("❌ Fetch languages failed: Network error - \(error.localizedDescription)") }
-                self.fallbackToCachedLanguages(completion: completion)
+                self.logError("Network error fetching languages: \(error.localizedDescription)")
+                self.fallbackToCachedLanguages(completion: completion) // Ensure fallback calls completion
                 return
             }
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                 if self.debugLogsEnabled { print("❌ Fetch languages failed: HTTP status \(statusCode)") }
+
+            // 2. Check HTTP Response (Keep or improve existing handling)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                self.logError("Invalid response received fetching languages.")
                  self.fallbackToCachedLanguages(completion: completion)
-                 return
-            }
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let languages = json["languages"] as? [String] else {
-                if self.debugLogsEnabled { print("❌ Fetch languages failed: Invalid JSON response.") }
-                self.fallbackToCachedLanguages(completion: completion)
                 return
             }
-            
-            if self.debugLogsEnabled {
-                print("🌐 Available languages from server: \(languages)")
+
+            guard (200...299).contains(httpResponse.statusCode) else {
+                let responseBody = data.flatMap { String(data: $0, encoding: .utf8) } ?? "No body"
+                self.logError("HTTP error fetching languages: \(httpResponse.statusCode). Body: \(responseBody)")
+                 self.fallbackToCachedLanguages(completion: completion)
+                return
             }
-            DispatchQueue.main.async { completion(languages) }
-            
+
+            // 3. Check for Data
+            guard let responseData = data else {
+                 self.logError("No data received fetching languages.")
+                 self.fallbackToCachedLanguages(completion: completion)
+                return
+            }
+
+            // 4. Parse the UNENCRYPTED JSON Response
+            do {
+                // Define a simple struct matching the expected JSON
+                struct LanguagesResponse: Decodable {
+                    let languages: [String]
+                }
+                let decodedResponse = try JSONDecoder().decode(LanguagesResponse.self, from: responseData)
+
+                // --- SUCCESS ---
+                // Cache the result if needed (add caching logic here if desired)
+                // self.cacheLanguages(decodedResponse.languages)
+
+                // Call the original completion handler on the main thread
+                DispatchQueue.main.async {
+                    completion(decodedResponse.languages) // <-- The crucial call back to your SwiftUI view
+                }
+
+            } catch {
+                self.logError("Failed to decode languages response: \(error). Data: \(String(data: responseData, encoding: .utf8) ?? "Invalid data")")
+                self.fallbackToCachedLanguages(completion: completion) // Fallback on decoding error
+            }
+
         }.resume()
     }
-    
-    /// Provides cached languages as a fallback if fetching from server fails.
+
+    /// Provides cached languages as a fallback if fetching from server fails. Thread-safe read.
     private func fallbackToCachedLanguages(completion: @escaping ([String]) -> Void) {
-        // Synchronize read access
-        let cachedLangs = cacheQueue.sync { () -> [String] in
-            var allLangs: Set<String> = []
-            // Iterate safely within the sync block
-            for (_, tabValues) in self.cache {
-                for (_, langMap) in tabValues {
-                    allLangs.formUnion(langMap.keys)
-                }
-            }
-             // Don't include "color" if it sneakily appears as a language key in __colors__
-             allLangs.remove("color")
-            return Array(allLangs).sorted() // Sort for consistency
-        }
-        
-        DispatchQueue.main.async {
-            if !cachedLangs.isEmpty {
-                if self.debugLogsEnabled {
-                    print("⚠️ Using cached languages as fallback: \(cachedLangs)")
-                }
-                completion(cachedLangs)
-            } else {
-                completion([]) // No cached languages either
-            }
-        }
+         let cachedLangs = cacheQueue.sync { () -> [String] in
+             var allLangs: Set<String> = []; for (_, tabValues) in self.cache { for (_, langMap) in tabValues { allLangs.formUnion(langMap.keys) } }; allLangs.remove("color"); return Array(allLangs).sorted()
+         }
+         DispatchQueue.main.async {
+             if !cachedLangs.isEmpty { if self.debugLogsEnabled { print("⚠️ Using cached languages as fallback: \(cachedLangs)") }; completion(cachedLangs) }
+             else { completion([]) }
+         }
     }
     
-    /// Helper struct for decoding authentication result.
-    private struct AuthResult: Decodable {
+    // Add logging functions to your SDK class for better debugging
+    private func logError(_ message: String) {
+        print("[CMSCureSDK Error] \(message)")
+    }
+    private func logDebug(_ message: String) {
+        #if DEBUG
+        print("[CMSCureSDK Debug] \(message)")
+        #endif
+    }
+
+    /// Helper struct for decoding original authentication result.
+    private struct AuthResult_Original: Decodable {
         let token: String?
-        // let projectSecret: String? // Secret usually isn't returned, it's provided by user
+        let userId: String?
+        let projectId: String?
+        let projectSecret: String?
+        // Note: Original backend might not have returned tabs, so tabs array is removed here
     }
-    
-    /// Prints an encrypted payload for testing purposes (e.g., Postman).
-    public func printEncryptedPayloadForTesting(apiKey: String, projectId: String) {
-        // Read key synchronously
-        let encryptedData = cacheQueue.sync {
-             let payload = ["apiKey": apiKey, "projectId": projectId]
-             return self.encryptBody(payload)
-        }
-        
-        guard let data = encryptedData,
-              let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: String],
-              let iv = json["iv"], let ct = json["ciphertext"], let tag = json["tag"] else {
-            print("❌ Failed to generate encrypted test payload.")
-            return
-        }
-        
-        print("""
-        🔐 Encrypted Payload for Postman (use as raw JSON Body):
-        {
-          "iv": "\(iv)",
-          "ciphertext": "\(ct)",
-          "tag": "\(tag)"
-        }
-        """)
+
+    /// Helper struct for decoding authentication result + tabs (Used if backend was modified to return tabs)
+    // Keep this separate if needed for testing different backend versions
+    private struct AuthResult_OriginalWithTabs: Decodable {
+        let token: String?
+        let userId: String?
+        let projectId: String?
+        let projectSecret: String?
+        let tabs: [String]? // Expect tabs array
     }
-    
+
+
+    /// Clean up resources when SDK instance is deallocated.
     deinit {
-        // Clean up observers and timers
         NotificationCenter.default.removeObserver(self)
         pollingTimer?.invalidate()
         stopListening() // Disconnect socket
     }
 }
 
-// MARK: - SwiftUI Color Extension (Keep as is)
-
+// MARK: - SwiftUI Color Extension
 extension Color {
-    /// Initializes a SwiftUI Color from a hex string (e.g., "#RRGGBB" or "RRGGBB").
+    /// Initializes a SwiftUI Color from a hex string (e.g., "#RRGGBB" or "RRGGBB"). Returns nil if invalid.
     init?(hex: String?) {
         guard var hexSanitized = hex?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
-        
+        guard hexSanitized.count == 6 else { return nil }
         var rgb: UInt64 = 0
-        
         guard Scanner(string: hexSanitized).scanHexInt64(&rgb) else { return nil }
-        guard hexSanitized.count == 6 else { return nil } // Ensure 6 hex digits
-        
-        self.init(
-            red: Double((rgb & 0xFF0000) >> 16) / 255.0,
-            green: Double((rgb & 0x00FF00) >> 8) / 255.0,
-            blue: Double(rgb & 0x0000FF) / 255.0
-        )
+        self.init(red: Double((rgb & 0xFF0000) >> 16) / 255.0, green: Double((rgb & 0x00FF00) >> 8) / 255.0, blue: Double(rgb & 0x0000FF) / 255.0)
     }
 }
 
-// MARK: - Notification Name (Keep as is)
-
+// MARK: - Notification Name
 extension Notification.Name {
-    /// Notification posted when translations or colors are updated.
+    /// Notification posted when translations or colors are updated via sync or socket event.
     /// The `userInfo` dictionary contains `["screenName": String]`.
     public static let translationsUpdated = Notification.Name("CMSCureTranslationsUpdated") // Make name more specific
 }
 
-// MARK: - Error Enum (Keep as is)
-
+// MARK: - Error Enum
 enum CMSCureSDKError: Error {
     case missingTokenOrProjectId
     case invalidResponse
     case decodingFailed
     case syncFailed(String) // Include screen name
     case socketDisconnected
-    case encryptionFailed
+    case encryptionFailed // Keep for this version
     case configurationError(String)
+    case authenticationFailed
+    case networkError(Error)
+    case serverError(statusCode: Int, message: String?)
 }
 
-// MARK: - String Extension for Convenience (Keep as is)
-
+// MARK: - String Extension for Convenience
 extension String {
-    // Helper to trigger refresh in SwiftUI views observing the bridge
-    private var bridgeWatcher: UUID {
-        CureTranslationBridge.shared.refreshToken
-    }
-    
+    /// Helper to trigger refresh in SwiftUI views observing the bridge.
+    private var bridgeWatcher: UUID { CureTranslationBridge.shared.refreshToken }
+
     /// Convenience method to get a translation using the shared CMSCureSDK instance.
     /// Example: `"my_label_key".cure(tab: "HomeScreen")`
     public func cure(tab: String) -> String {
         _ = bridgeWatcher // Reads the publisher to ensure view updates
-        // Calls the thread-safe translation method
-        return Cure.shared.translation(for: self, inTab: tab)
+        return Cure.shared.translation(for: self, inTab: tab) // Calls thread-safe SDK method
     }
 }
 
-// MARK: - Observable Objects for SwiftUI (Keep as is, they call thread-safe SDK methods)
+// MARK: - Observable Objects for SwiftUI
+
+/// Shared bridge object whose `refreshToken` changes trigger updates in CureString/CureColor/CureImage.
+final class CureTranslationBridge: ObservableObject {
+    static let shared = CureTranslationBridge()
+    @Published var refreshToken = UUID() // Change this UUID to trigger updates
+    private init() {}
+}
 
 /// Observable object to automatically update a String value in SwiftUI views.
 public final class CureString: ObservableObject {
     private let key: String
     private let tab: String
     private var cancellable: AnyCancellable? = nil
-    
     @Published public private(set) var value: String = ""
-    
-    public init(_ key: String, tab: String) {
-        self.key = key
-        self.tab = tab
-        // Initial value fetch is now thread-safe
-        self.value = Cure.shared.translation(for: key, inTab: tab)
-        
-        // Observe the bridge's refreshToken publisher
-        cancellable = CureTranslationBridge.shared.$refreshToken
-            .receive(on: DispatchQueue.main) // Ensure updates happen on main thread
-            .sink { [weak self] _ in
-                self?.updateValue()
-            }
-    }
-    
-    private func updateValue() {
-        // Fetching the value is thread-safe
-        let newValue = Cure.shared.translation(for: key, inTab: tab)
-        // Update @Published property only if value changed
-        if newValue != self.value {
-            self.value = newValue
-        }
-    }
-    
-    // No need for NotificationCenter observation if using the bridge publisher
-    // deinit { NotificationCenter.default.removeObserver(self) }
-}
 
-/// Shared bridge object whose `refreshToken` changes trigger updates in CureString/CureColor.
-final class CureTranslationBridge: ObservableObject {
-    static let shared = CureTranslationBridge()
-    @Published var refreshToken = UUID()
-    
-    private init() {
-        // No need for NotificationCenter observation here if postTranslationsUpdatedNotification updates refreshToken
+    public init(_ key: String, tab: String) {
+        self.key = key; self.tab = tab
+        self.value = Cure.shared.translation(for: key, inTab: tab) // Initial thread-safe fetch
+        cancellable = CureTranslationBridge.shared.$refreshToken
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateValue() }
     }
+    private func updateValue() { let newValue = Cure.shared.translation(for: key, inTab: tab); if newValue != self.value { self.value = newValue } }
 }
 
 /// Observable object to automatically update a Color value in SwiftUI views.
 public final class CureColor: ObservableObject {
     private let key: String
     private var cancellable: AnyCancellable? = nil
-    
     @Published public private(set) var value: Color? // Use SwiftUI Color
-    
+
     public init(_ key: String) {
         self.key = key
-        // Initial value fetch is thread-safe
-        self.value = Color(hex: Cure.shared.colorValue(for: key))
-        
-        // Observe the bridge's refreshToken publisher
+        self.value = Color(hex: Cure.shared.colorValue(for: key)) // Initial thread-safe fetch
         cancellable = CureTranslationBridge.shared.$refreshToken
-            .receive(on: DispatchQueue.main) // Ensure updates happen on main thread
-            .sink { [weak self] _ in
-                self?.updateValue()
-            }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateValue() }
     }
-    
-    private func updateValue() {
-        // Fetching the value is thread-safe
-        let newValue = Color(hex: Cure.shared.colorValue(for: key))
-        // Update @Published property only if value changed
-        if newValue != self.value {
-             self.value = newValue
-        }
-    }
-    
-    // No need for NotificationCenter observation if using the bridge publisher
-    // deinit { NotificationCenter.default.removeObserver(self) }
+    private func updateValue() { let newValue = Color(hex: Cure.shared.colorValue(for: key)); if newValue != self.value { self.value = newValue } }
 }
 
 /// Observable object to automatically update a URL value (intended for images) in SwiftUI views.
@@ -1343,34 +1236,20 @@ public final class CureImage: ObservableObject {
     private let key: String
     private let tab: String
     private var cancellable: AnyCancellable? = nil
-
     @Published public private(set) var value: URL? // Stores the URL for the image
 
     public init(_ key: String, tab: String) {
-        self.key = key
-        self.tab = tab
-        // Initial value fetch (implement imageUrl function in SDK)
-        self.value = Cure.shared.imageUrl(for: key, inTab: tab) // <- New SDK function needed
-
-        // Observe the bridge's refreshToken publisher for updates
+        self.key = key; self.tab = tab
+        self.value = Cure.shared.imageUrl(for: key, inTab: tab) // Initial thread-safe fetch
         cancellable = CureTranslationBridge.shared.$refreshToken
-            .receive(on: DispatchQueue.main) // Ensure updates happen on main thread
-            .sink { [weak self] _ in
-                self?.updateValue()
-            }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateValue() }
     }
-
-    private func updateValue() {
-        // Fetching the value is thread-safe (assuming imageUrl is)
-        let newValue = Cure.shared.imageUrl(for: key, inTab: tab) // <- New SDK function needed
-        // Update @Published property only if value changed
-        if newValue != self.value {
-            self.value = newValue
-        }
-    }
+    private func updateValue() { let newValue = Cure.shared.imageUrl(for: key, inTab: tab); if newValue != self.value { self.value = newValue } }
 }
 
-// SocketIOClient status description helper
+// MARK: - SocketIOStatus Extension
+/// Helper to provide a description for Socket.IO connection statuses.
 extension SocketIOStatus {
     var description: String {
         switch self {
