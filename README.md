@@ -2,7 +2,7 @@
 
 [![Swift Package Manager compatible](https://img.shields.io/badge/Swift%20Package%20Manager-compatible-brightgreen.svg)](https://swift.org/package-manager/)
 [![Platform](https://img.shields.io/badge/platform-iOS%2013%2B-blue.svg)](https://developer.apple.com/ios/)
-[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.0)
+[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.1)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE.md) **CMSCureSDK** provides a seamless way to integrate your iOS application with the CMSCure platform. Manage and deliver dynamic content, translations, colors, and image URLs to your app with real-time updates and offline caching capabilities.
 
 ## Features
@@ -58,9 +58,6 @@ func application(_ application: UIApplication, didFinishLaunchingWithOptions lau
 
     // Optional: Enable debug logs during development (defaults to true)
     Cure.shared.debugLogsEnabled = true
-
-    // Optional: Adjust polling interval for content updates (defaults to 300 seconds)
-    // Cure.shared.pollingInterval = 180
 
     return true
 }

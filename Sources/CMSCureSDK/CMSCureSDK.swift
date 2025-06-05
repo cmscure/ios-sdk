@@ -32,7 +32,7 @@ public typealias Cure = CMSCureSDK
 /// - Configuration: Must be configured once with project-specific credentials.
 /// - Authentication: Handles authentication with the backend.
 /// - Data Caching: Stores fetched content (translations, colors) in an in-memory cache with disk persistence.
-/// - Synchronization: Fetches content updates via API calls (polling) and real-time socket events.
+/// - Synchronization: Fetches content updates via API calls and real-time socket events.
 /// - Language Management: Allows setting and retrieving the active language for content.
 /// - Socket Communication: Manages a WebSocket connection for receiving live updates.
 /// - Thread Safety: Uses dispatch queues to ensure thread-safe access to shared resources.
@@ -97,20 +97,6 @@ public class CMSCureSDK {
     /// Default is `true`. Set to `false` for production releases to reduce console noise.
     public var debugLogsEnabled: Bool = true
     
-    /// The interval, in seconds, at which the SDK periodically polls the server for content updates.
-    /// Defaults to 300 seconds (5 minutes). Minimum is 60 seconds, maximum is 600 seconds.
-    /// Setting this property will reset and restart the polling timer if it's active.
-    public var pollingInterval: TimeInterval = 300 {
-        didSet {
-            // Enforce bounds: minimum 60s, maximum 600s.
-            pollingInterval = max(60, min(pollingInterval, 600))
-            DispatchQueue.main.async { // Timer operations should be on the main thread.
-                // If the timer is already running, re-setup to apply the new interval.
-                if self.pollingTimer != nil { self.setupPollingTimer() }
-            }
-        }
-    }
-    
     // MARK: - Persistence File Paths
     // URLs for storing SDK data (cache, tabs, legacy config) in the app's Documents directory.
     
@@ -145,8 +131,6 @@ public class CMSCureSDK {
     private var socket: SocketIOClient?
     /// The manager for the Socket.IO client, responsible for connection and configuration.
     private var manager: SocketManager?
-    /// A timer for periodically polling the server for content updates.
-    private var pollingTimer: Timer?
     
     /// A dictionary mapping screen names (tabs) to their respective update handlers.
     /// These handlers are called when translations for a screen are updated.
@@ -156,7 +140,7 @@ public class CMSCureSDK {
     /// Accessed via `cacheQueue`.
     private var handshakeAcknowledged = false
     
-    /// Timestamp of the last successful full sync operation. Can be used to optimize polling.
+    /// Timestamp of the last successful full sync operation.
     private var lastSyncCheck: Date? // TODO: Implement logic to use this for optimizing syncIfOutdated.
     
     // MARK: - Initialization
@@ -181,7 +165,6 @@ public class CMSCureSDK {
         // Defer operations that require the main run loop or app lifecycle notifications.
         DispatchQueue.main.async {
             self.observeAppActiveNotification() // Listen for app becoming active to trigger syncs.
-            self.setupPollingTimer()            // Start the content polling mechanism.
             // Note: `startListening()` (which connects the socket) is now called at the end of `configure()`.
         }
         
@@ -574,10 +557,8 @@ public class CMSCureSDK {
         
         if self.debugLogsEnabled { print("🧹 Cache, Tabs List, Config files, and runtime SDK configuration have been cleared.") }
         
-        // Stop any active listening (socket connection, polling).
+        // Stop any active listening (socket connection).
         stopListening() // Disconnects socket.
-        pollingTimer?.invalidate() // Stops polling timer.
-        pollingTimer = nil
     }
     
     // MARK: - Public API - Content Accessors
@@ -932,7 +913,6 @@ public class CMSCureSDK {
     ///
     /// This method is typically called:
     /// - When the app becomes active.
-    /// - Periodically by the polling timer.
     /// - After a successful Socket.IO connection and handshake.
     ///
     /// It checks if the SDK is configured and if necessary secrets (for encryption) are available before proceeding.
@@ -1042,7 +1022,7 @@ public class CMSCureSDK {
                 .reconnectAttempts(-1),      // Retry indefinitely.
                 .reconnectWait(3),           // Initial wait time before reconnect attempt (seconds).
                 .reconnectWaitMax(10),       // Maximum wait time between reconnect attempts.
-                .forceWebsockets(true),      // IMPORTANT: Use WebSockets only, no HTTP long-polling fallback.
+                .forceWebsockets(true),      // IMPORTANT: Use WebSockets only
                 .secure(true),               // IMPORTANT: Explicitly state that WSS is a secure connection.
                 .selfSigned(false),          // IMPORTANT: Set to false for publicly trusted certs (like Let's Encrypt).
                 .path("/socket.io/")         // IMPORTANT: Explicitly set the Socket.IO connection path.
@@ -1435,7 +1415,7 @@ public class CMSCureSDK {
         return jsonObject
     }
     
-    // MARK: - Application Lifecycle & Polling Timer
+    // MARK: - Application Lifecycle
     
     /// Observes the `UIApplication.didBecomeActiveNotification` to trigger actions when the app returns to the foreground.
     private func observeAppActiveNotification() {
@@ -1464,25 +1444,6 @@ public class CMSCureSDK {
             startListening() // Attempt to connect if not already.
         }
         syncIfOutdated() // Always check for outdated content on app active.
-    }
-    
-    /// Sets up or resets the periodic polling timer for content updates.
-    /// The timer interval is controlled by the `pollingInterval` property.
-    private func setupPollingTimer() {
-        // Invalidate any existing timer before creating a new one.
-        pollingTimer?.invalidate()
-        pollingTimer = nil // Ensure old timer is released.
-        
-        // Schedule a new timer on the main run loop.
-        pollingTimer = Timer.scheduledTimer(
-            withTimeInterval: pollingInterval,
-            repeats: true
-        ) { [weak self] _ in // Use weak self to avoid retain cycles.
-            guard let self = self else { return }
-            if self.debugLogsEnabled { print("⏰ Polling timer fired. Triggering `syncIfOutdated`.") }
-            self.syncIfOutdated()
-        }
-        if debugLogsEnabled { print("⏱️ Polling timer configured with interval: \(pollingInterval) seconds.") }
     }
     
     // MARK: - Legacy Encryption Helper
@@ -1739,8 +1700,6 @@ public class CMSCureSDK {
     /// and disconnecting the socket, when the SDK singleton instance is deallocated.
     deinit {
         NotificationCenter.default.removeObserver(self) // Remove all observers added by this instance.
-        pollingTimer?.invalidate()                      // Stop the polling timer.
-        pollingTimer = nil
         stopListening()                                 // Ensure socket is disconnected and resources are released.
         if debugLogsEnabled { print("✨ CMSCureSDK Deinitialized and resources cleaned up.") }
     }
