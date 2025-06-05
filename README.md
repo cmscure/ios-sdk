@@ -50,10 +50,7 @@ func application(_ application: UIApplication, didFinishLaunchingWithOptions lau
     Cure.shared.configure(
         projectId: "YOUR_PROJECT_ID",
         apiKey: "YOUR_API_KEY",
-        projectSecret: "YOUR_PROJECT_SECRET",
-        // Optional: Specify custom server URLs if not using the defaults
-        // serverUrlString: "[https://your.custom.server.com](https://your.custom.server.com)",
-        // socketIOURLString: "wss://your.custom.socketserver.com"
+        projectSecret: "YOUR_PROJECT_SECRET"
     )
 
     // Optional: Enable debug logs during development (defaults to true)
@@ -68,8 +65,6 @@ func application(_ application: UIApplication, didFinishLaunchingWithOptions lau
 * `projectId` (String): Your unique Project ID from the CMSCure dashboard.
 * `apiKey` (String): Your secret API Key from CMSCure, used for authenticating API requests.
 * `projectSecret` (String): Your Project Secret from CMSCure, used for legacy encryption and Socket.IO handshake.
-* `serverUrlString` (String, Optional): The base URL for your CMSCure backend API. Defaults to `https://app.cmscure.com`.
-* `socketIOURLString` (String, Optional): The URL for your CMSCure Socket.IO server. Defaults to `wss://app.cmscure.com`.
 
 ## Core Usage
 

@@ -52,8 +52,8 @@ public class CMSCureSDK {
         let projectId: String       /// The unique identifier for your project in CMSCure.
         let apiKey: String          /// The API key used for authenticating requests with the CMSCure backend.
         let projectSecret: String   /// The secret key associated with your project, used for legacy encryption and handshake validation.
-        let serverUrl: URL          /// The base URL for the CMSCure backend API (e.g., `https://app.cmscure.com`).
-        let socketIOURL: URL        /// The URL for the CMSCure Socket.IO server (e.g., `wss://app.cmscure.com`).
+//        let serverUrl: URL          /// The base URL for the CMSCure backend API (e.g., `https://app.cmscure.com`).
+//        let socketIOURL: URL        /// The URL for the CMSCure Socket.IO server (e.g., `wss://app.cmscure.com`).
     }
     
     /// Holds the active SDK configuration. This is `nil` until `configure()` is successfully called.
@@ -143,6 +143,13 @@ public class CMSCureSDK {
     /// Timestamp of the last successful full sync operation.
     private var lastSyncCheck: Date? // TODO: Implement logic to use this for optimizing syncIfOutdated.
     
+    private let serverUrlString: String = "https://app.cmscure.com" // Default server URL
+    private let socketIOURLString: String = "wss://app.cmscure.com"  // Default Socket.IO URL
+    
+    private var serverURL: URL!
+    private var socketIOUrl: URL!
+    
+    
     // MARK: - Initialization
     
     /// Private initializer to enforce the singleton pattern.
@@ -151,6 +158,10 @@ public class CMSCureSDK {
     /// **Important:** The SDK is not fully operational after `init()`. The `configure()` method
     /// **MUST** be called to provide necessary credentials and URLs.
     private init() {
+        
+        self.serverURL = URL(string: serverUrlString)!
+        self.socketIOUrl = URL(string: socketIOURLString)!
+        
         // Load non-sensitive state synchronously as it's safe during singleton initialization.
         loadCacheFromDisk() // Loads self.cache and also calls loadOfflineTabListFromDisk() internally.
         self.currentLanguage = UserDefaults.standard.string(forKey: "selectedLanguage") ?? "en"
@@ -204,9 +215,7 @@ public class CMSCureSDK {
     public func configure(
         projectId: String,
         apiKey: String,
-        projectSecret: String,
-        serverUrlString: String = "https://app.cmscure.com", // Default server URL
-        socketIOURLString: String = "wss://app.cmscure.com"  // Default Socket.IO URL
+        projectSecret: String
     ) {
         // --- Input Validation ---
         guard !projectId.isEmpty else { logError("Configuration failed: Project ID cannot be empty."); return }
@@ -231,9 +240,7 @@ public class CMSCureSDK {
         let newConfiguration = CureConfiguration(
             projectId: projectId,
             apiKey: apiKey,
-            projectSecret: projectSecret,
-            serverUrl: serverUrl,
-            socketIOURL: socketUrl
+            projectSecret: projectSecret
         )
         
         var sdkAlreadyConfigured = false
@@ -315,8 +322,8 @@ public class CMSCureSDK {
         
         // --- Construct Authentication Request ---
         // This legacy auth endpoint expects projectId in query and a plain JSON body.
-        guard var urlComponents = URLComponents(url: config.serverUrl, resolvingAgainstBaseURL: false) else {
-            logError("Legacy Auth failed: Could not initialize URLComponents from server URL '\(config.serverUrl)'.")
+        guard var urlComponents = URLComponents(url: self.serverURL, resolvingAgainstBaseURL: false) else {
+            logError("Legacy Auth failed: Could not initialize URLComponents from server URL '\(self.serverURL)'.")
             completion(false); return
         }
         urlComponents.path = "/api/sdk/auth" // Standard auth path
@@ -686,7 +693,7 @@ public class CMSCureSDK {
         let apiKey = config.apiKey // API Key is now always taken from the current configuration.
         
         // --- Construct Full URL ---
-        var urlComponents = URLComponents(url: config.serverUrl, resolvingAgainstBaseURL: false)
+        var urlComponents = URLComponents(url: self.serverURL, resolvingAgainstBaseURL: false)
         urlComponents?.path = endpointPath // Set the base endpoint path.
         
         if appendProjectIdToPath {
@@ -698,7 +705,7 @@ public class CMSCureSDK {
         }
         
         guard let finalUrl = urlComponents?.url else {
-            logError("Cannot create authenticated request: Failed to construct valid URL for endpoint '\(endpointPath)' with base '\(config.serverUrl)'.")
+            logError("Cannot create authenticated request: Failed to construct valid URL for endpoint '\(endpointPath)' with base '\(self.serverURL)'.")
             return nil
         }
         
@@ -990,7 +997,7 @@ public class CMSCureSDK {
         }
         
         let projectId = config.projectId
-        let socketConnectionUrl = config.socketIOURL
+        let socketConnectionUrl = self.socketIOUrl
         
         // Socket operations should be performed on the main thread.
         // A small delay can sometimes help if called very early in rapid succession.
@@ -1029,7 +1036,7 @@ public class CMSCureSDK {
             ]
             
             if self.debugLogsEnabled { print("🔌 Creating new SocketManager for URL: \(socketConnectionUrl) with path: /socket.io/") }
-            self.manager = SocketManager(socketURL: socketConnectionUrl, config: socketClientConfig)
+            self.manager = SocketManager(socketURL: self.socketIOUrl, config: socketClientConfig)
             
             guard let currentManager = self.manager else {
                 self.logError("Failed to initialize SocketManager. Socket connection aborted."); return
@@ -1259,7 +1266,7 @@ public class CMSCureSDK {
         
         // Proceed with connection attempt as configuration and necessary secrets are present.
         logDebug("`startListening` called: Configuration and projectSecret are present. Attempting socket connection...")
-        print("🔗 Connecting to socket endpoint: \(currentConfig.socketIOURL.absoluteString)")
+        print("🔗 Connecting to socket endpoint: \(self.socketIOUrl.absoluteString)")
         
         connectSocket() // `connectSocket` handles the actual connection logic using details from `currentConfig`.
     }
