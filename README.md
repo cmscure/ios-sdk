@@ -117,7 +117,8 @@ Fetch an image URL that is stored as a value within a specific translations tab.
 let bannerURL: URL? = Cure.shared.imageUrl(for: "hero_banner_image", inTab: "home_screen_assets")
 ```
 
-**Displaying Images for Offline Support**
+### Displaying Images for Offline Support
+
 To ensure images are cached and available offline, you **must use `KFImage` from the Kingfisher library** to display them. The SDK automatically pre-fetches and caches images in the background, and `KFImage` knows how to read from that cache.
 
 ```swift

@@ -1987,6 +1987,49 @@ public final class CureImage: ObservableObject {
     }
 }
 
+// MARK: - NEW: Public SDKImage View
+// This is the new, recommended way to display images from the CMS.
+public extension Cure {
+    /// A ready-to-use, cache-enabled SwiftUI View for displaying images from CMSCure.
+    ///
+    /// This view internally uses Kingfisher to handle downloading, memory/disk caching,
+    /// and displaying the image, providing robust offline support automatically.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// if let url = Cure.shared.imageURL(forKey: "logo_primary") {
+    ///     Cure.SDKImage(url: url)
+    ///         .aspectRatio(contentMode: .fit)
+    ///         .frame(height: 50)
+    /// }
+    /// ```
+    struct SDKImage: View {
+        private let url: URL?
+
+        /// Initializes the view with a URL.
+        /// - Parameter url: The URL of the image to display, typically retrieved from
+        ///   `Cure.shared.imageURL(forKey:)` or `Cure.shared.imageUrl(for:inTab:)`.
+        public init(url: URL?) {
+            self.url = url
+        }
+
+        public var body: some View {
+            // Internally, this view uses KFImage to leverage its powerful features.
+            // The app developer does not need to know about or import Kingfisher.
+            KFImage(url)
+                .resizable() // Default to resizable
+                .placeholder {
+                    // Provide a default, sensible placeholder.
+                    ZStack {
+                        Color.gray.opacity(0.1)
+                        ProgressView()
+                    }
+                }
+                .fade(duration: 0.25) // Add a subtle fade-in transition.
+        }
+    }
+}
+
 // MARK: - SocketIOStatus Convenience Extension
 
 extension SocketIOStatus {
