@@ -9,6 +9,7 @@ import SocketIO // For real-time communication via WebSockets
 import CryptoKit // For cryptographic operations like hashing (SHA256) and encryption (AES.GCM)
 import Combine // For reactive programming patterns, particularly for SwiftUI integration
 import SwiftUI // For UI-related types like Color and ObservableObject helpers
+import Kingfisher
 
 // MARK: - Public Typealiases
 
@@ -52,8 +53,6 @@ public class CMSCureSDK {
         let projectId: String       /// The unique identifier for your project in CMSCure.
         let apiKey: String          /// The API key used for authenticating requests with the CMSCure backend.
         let projectSecret: String   /// The secret key associated with your project, used for legacy encryption and handshake validation.
-//        let serverUrl: URL          /// The base URL for the CMSCure backend API (e.g., `https://app.cmscure.com`).
-//        let socketIOURL: URL        /// The URL for the CMSCure Socket.IO server (e.g., `wss://app.cmscure.com`).
     }
     
     /// Holds the active SDK configuration. This is `nil` until `configure()` is successfully called.
@@ -158,33 +157,22 @@ public class CMSCureSDK {
     /// **Important:** The SDK is not fully operational after `init()`. The `configure()` method
     /// **MUST** be called to provide necessary credentials and URLs.
     private init() {
-        
         self.serverURL = URL(string: serverUrlString)!
         self.socketIOUrl = URL(string: socketIOURLString)!
         
-        // Load non-sensitive state synchronously as it's safe during singleton initialization.
-        loadCacheFromDisk() // Loads self.cache and also calls loadOfflineTabListFromDisk() internally.
+        loadCacheFromDisk()
         self.currentLanguage = UserDefaults.standard.string(forKey: "selectedLanguage") ?? "en"
         
-        // Load persisted legacy config (e.g., authToken from a previous session).
-        // This is part of a legacy flow and might be phased out.
         if let savedLegacyConfig = readLegacyConfigFromDisk() {
-            // Safely update authToken.
             cacheQueue.sync { self.authToken = savedLegacyConfig["authToken"] }
         }
         
-        // Defer operations that require the main run loop or app lifecycle notifications.
         DispatchQueue.main.async {
-            self.observeAppActiveNotification() // Listen for app becoming active to trigger syncs.
-            // Note: `startListening()` (which connects the socket) is now called at the end of `configure()`.
+            self.observeAppActiveNotification()
         }
         
-        // Initial log messages for debugging.
         if debugLogsEnabled {
             print("🚀 CMSCureSDK Initialized. **Waiting for configure() call.**")
-            print("   - Initial Language: \(self.currentLanguage)")
-            print("   - Initial Offline Tabs: \(self.offlineTabList)") // Log tabs loaded from disk.
-            if self.authToken != nil { print("   - Found saved legacy auth token.") }
         }
     }
     
@@ -212,39 +200,17 @@ public class CMSCureSDK {
     ///                      Defaults to "https://app.cmscure.com". Must use HTTPS in production.
     ///   - socketIOURLString: The URL string for your CMSCure Socket.IO server (e.g., "wss://app.cmscure.com").
     ///                        Defaults to "wss://app.cmscure.com". Must use WSS in production.
-    public func configure(
-        projectId: String,
-        apiKey: String,
-        projectSecret: String
-    ) {
-        // --- Input Validation ---
+    public func configure(projectId: String, apiKey: String, projectSecret: String) {
+        // Ensure configuration parameters are valid.
         guard !projectId.isEmpty else { logError("Configuration failed: Project ID cannot be empty."); return }
         guard !apiKey.isEmpty else { logError("Configuration failed: API Key cannot be empty."); return }
         guard !projectSecret.isEmpty else { logError("Configuration failed: Project Secret cannot be empty."); return }
         
-        guard let serverUrl = URL(string: serverUrlString), let socketUrl = URL(string: socketIOURLString) else {
-            logError("Configuration failed: Invalid server or socket URL format."); return
-        }
-        
-        // Enforce HTTPS/WSS for non-DEBUG builds.
-#if !DEBUG
-        guard serverUrl.scheme == "https" else {
-            logError("Configuration failed: Server URL must use HTTPS in production builds (non-DEBUG)."); return
-        }
-        guard socketUrl.scheme == "wss" else {
-            logError("Configuration failed: Socket URL must use WSS in production builds (non-DEBUG)."); return
-        }
-#endif
-        
-        // --- Create and Store Configuration (Thread-Safe) ---
-        let newConfiguration = CureConfiguration(
-            projectId: projectId,
-            apiKey: apiKey,
-            projectSecret: projectSecret
-        )
+        // Create the configuration object.
+        let newConfiguration = CureConfiguration(projectId: projectId, apiKey: apiKey, projectSecret: projectSecret)
         
         var sdkAlreadyConfigured = false
-        configQueue.sync { // Synchronous write to ensure configuration is set before proceeding.
+        configQueue.sync {
             if self.configuration != nil {
                 sdkAlreadyConfigured = true
             } else {
@@ -253,37 +219,21 @@ public class CMSCureSDK {
         }
         
         if sdkAlreadyConfigured {
-            // Log an error but don't crash. Subsequent calls might be accidental.
             logError("Configuration ignored: SDK has already been configured."); return
         }
         
-        logDebug("CMSCureSDK Configured successfully for Project ID: \(projectId)")
-        logDebug("   - API Base URL: \(serverUrl.absoluteString)")
-        logDebug("   - Socket Base URL: \(socketUrl.absoluteString)")
-        
-        // --- Derive Legacy Symmetric Key (Thread-Safe Asynchronous Write) ---
-        // This key is used for encrypting request bodies or socket handshake in legacy flows.
-        cacheQueue.async(flags: .barrier) { // Use a barrier task for exclusive write access.
-            self.apiSecret = projectSecret // Store projectSecret for key derivation.
+        // Asynchronously derive the cryptographic key on the cache queue.
+        cacheQueue.async(flags: .barrier) {
+            self.apiSecret = projectSecret
             if let secretData = projectSecret.data(using: .utf8) {
                 self.symmetricKey = SymmetricKey(data: SHA256.hash(data: secretData))
-                self.logDebug("🔑 Symmetric key derived from projectSecret.")
-            } else {
-                self.logError("⚠️ Failed to create UTF-8 data from projectSecret for key derivation. Encryption may fail.");
-                self.symmetricKey = nil
             }
         }
         
-        // --- Trigger Internal Legacy Authentication & Connection Setup ---
-        // This sequence handles authentication, socket connection, and initial sync.
-        _performLegacyAuthenticationAndConnect { [weak self] success in
-            guard let self = self else { return }
+        // Perform initial authentication and setup.
+        _performLegacyAuthenticationAndConnect { success in
             if success {
-                self.logDebug("✅ Internal legacy authentication and connection setup successful. SDK is ready.")
-                // Optional: Trigger an immediate sync of content after successful setup.
                 self.syncIfOutdated()
-            } else {
-                self.logError("🆘 Internal legacy authentication or connection setup failed. SDK functionality may be limited (e.g., real-time updates, encrypted sync). Check previous logs for details.")
             }
         }
     }
@@ -309,135 +259,59 @@ public class CMSCureSDK {
     /// - Parameter completion: A closure called with `true` if authentication and subsequent setup steps succeed, `false` otherwise.
     private func _performLegacyAuthenticationAndConnect(completion: @escaping (Bool) -> Void) {
         guard let config = getCurrentConfiguration() else {
-            logError("_performLegacyAuthenticationAndConnect: SDK not configured. Cannot proceed.")
+            logError("_performLegacyAuthenticationAndConnect: SDK not configured.")
             completion(false); return
         }
         
-        let projectId = config.projectId
-        let apiKey = config.apiKey
-        // The projectSecret is available via `config.projectSecret` if needed for other parts of this flow,
-        // but this specific auth call uses an unencrypted body with API key in header.
-        
-        logDebug("Attempting internal legacy authentication (unencrypted request body)...")
-        
-        // --- Construct Authentication Request ---
-        // This legacy auth endpoint expects projectId in query and a plain JSON body.
-        guard var urlComponents = URLComponents(url: self.serverURL, resolvingAgainstBaseURL: false) else {
-            logError("Legacy Auth failed: Could not initialize URLComponents from server URL '\(self.serverURL)'.")
-            completion(false); return
-        }
-        urlComponents.path = "/api/sdk/auth" // Standard auth path
-        urlComponents.queryItems = [URLQueryItem(name: "projectId", value: projectId)] // projectId as query parameter
-        
-        guard let authUrl = urlComponents.url else {
-            logError("Legacy Auth failed: Could not construct final URL from components.")
+        guard let authUrl = URL(string: "\(self.serverURL.absoluteString)/api/sdk/auth") else {
+            logError("Legacy Auth failed: Could not construct auth URL.")
             completion(false); return
         }
         
-        // Prepare the plain JSON body
-        let requestBody: [String: String] = ["apiKey": apiKey, "projectId": projectId]
-        var plainJsonHttpBody: Data?
-        do {
-            plainJsonHttpBody = try JSONSerialization.data(withJSONObject: requestBody, options: [])
-        } catch {
-            logError("Legacy Auth failed: Could not serialize plain JSON request body: \(error)"); completion(false); return
+        let requestBody: [String: String] = ["apiKey": config.apiKey, "projectId": config.projectId]
+        guard let plainJsonHttpBody = try? JSONSerialization.data(withJSONObject: requestBody) else {
+            logError("Legacy Auth failed: Could not serialize plain JSON request body.")
+            completion(false); return
         }
         
-        // Create the URLRequest
         var request = URLRequest(url: authUrl)
         request.httpMethod = "POST"
-        request.timeoutInterval = 15 // Standard timeout
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key") // API Key is also sent as a header for this legacy endpoint.
         request.httpBody = plainJsonHttpBody
         
-        logDebug("🔑 Sending internal legacy authenticate call (Plain JSON Body + API Key Header) to \(authUrl.path)...")
-        
-        // --- Execute Network Request ---
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { completion(false); return }
-            
-            // Use helper to handle common network response checks (errors, status codes)
-            guard let responseData = self.handleNetworkResponse(data: data, response: response, error: error, context: "internal legacy authenticating") else {
-                // `handleNetworkResponse` logs specific errors.
+            guard let self = self,
+                  let responseData = self.handleNetworkResponse(data: data, response: response, error: error, context: "internal legacy authenticating")
+            else {
                 DispatchQueue.main.async { completion(false) }; return
             }
             
-            // Check for empty but successful response (e.g., 204 No Content, or 200 OK with no actual body)
-            if responseData.isEmpty {
-                // This might be an unexpected scenario if the auth endpoint should always return data.
-                self.logError("Legacy Auth failed: Received an empty but successful (2xx) response. Expected token and tabs.")
-                DispatchQueue.main.async { completion(false) }; return
-            }
-            
-            // --- Decode JSON Response ---
             do {
-                // Decode the response into the expected structure.
                 let authResult = try JSONDecoder().decode(AuthResult_OriginalWithTabs.self, from: responseData)
-                
-                // Validate essential fields from the decoded response.
-                guard let receivedToken = authResult.token, !receivedToken.isEmpty,
-                      let receivedProjectSecret = authResult.projectSecret, !receivedProjectSecret.isEmpty else {
-                    self.logError("Legacy Auth failed: Response decoded successfully, but essential fields (token, projectSecret) were missing, null, or empty.")
-                    self.logError("   - Raw Response Data: \(String(data: responseData, encoding: .utf8) ?? "Invalid UTF-8 data")")
+                guard let receivedToken = authResult.token, !receivedToken.isEmpty else {
+                    self.logError("Legacy Auth failed: Response did not contain a token.")
                     DispatchQueue.main.async { completion(false) }; return
                 }
                 
-                // --- Authentication Successful ---
-                // let receivedUserId = authResult.userId // Optional, depending on backend and SDK needs.
-                let receivedTabs = authResult.tabs ?? [] // Default to empty array if tabs are missing.
-                
-                let legacyConfigToPersist: [String: String] = [
-                    "authToken": receivedToken,
-                    "projectSecret": receivedProjectSecret // Persist the secret confirmed by the server.
-                ]
-                
-                // Update internal state and persist relevant data (Thread-Safe Write via cacheQueue).
-                self.cacheQueue.async(flags: .barrier) { // Barrier task for exclusive write access.
+                // Update internal state and persist data.
+                self.cacheQueue.async(flags: .barrier) {
                     self.authToken = receivedToken
-                    // Decision Point: Should `self.apiSecret` and `self.symmetricKey` be updated/re-derived
-                    // if `receivedProjectSecret` differs from the one in `configuration`?
-                    // For now, we assume the initial `projectSecret` from `configure()` is the source of truth
-                    // for key derivation, and `receivedProjectSecret` is primarily for persistence/validation.
-                    // If `receivedProjectSecret` is the new source of truth, re-derive symmetricKey here.
-                    
+                    let receivedTabs = authResult.tabs ?? []
                     self.knownProjectTabs = Set(receivedTabs)
-                    self.offlineTabList = Array(receivedTabs) // Keep array version for ordered persistence.
-                    
-                    let configSavedSuccessfully = self.saveLegacyConfigToDisk(legacyConfigToPersist)
+                    self.offlineTabList = Array(receivedTabs)
+                    self.saveLegacyConfigToDisk(["authToken": receivedToken])
                     self.saveOfflineTabListToDisk()
                     
-                    // --- Post-Authentication Setup (Socket Connection & Initial Sync) ---
                     DispatchQueue.main.async {
-                        if self.debugLogsEnabled { print("✅ Internal legacy authenticate successful. Token: \(receivedToken.prefix(8))... Known Tabs: \(receivedTabs)") }
-                        
-                        // Now that legacy auth (if required by backend design) is done,
-                        // and we have potentially updated secrets/tokens, proceed to connect the socket
-                        // and perform an initial content sync.
-                        self.startListening() // This will attempt to connect the socket.
-                        
-                        completion(configSavedSuccessfully) // Completion depends on successful persistence of config.
+                        self.startListening()
+                        completion(true)
                     }
                 }
-                // --- End Authentication Successful ---
-                
-            } catch let decodingError as DecodingError {
-                // Handle specific JSON decoding errors with more context.
-                self.logError("🆘 Legacy Auth Decoding Error: \(decodingError.localizedDescription)") // General description
-                self.logError("   - Detailed Decoding Error: \(decodingError)") // Full error details
-                // Optionally, add more specific logging for different DecodingError cases as before.
-                self.logError("   - Raw Auth Response causing decoding error: \(String(data: responseData, encoding: .utf8) ?? "Invalid UTF-8 data")")
-                DispatchQueue.main.async { completion(false) }; return
-                
-            } catch { // Handle any other errors during JSON processing.
-                self.logError("🆘 Legacy Auth failed: An unknown error occurred during JSON response processing. Error: \(error)")
-                self.logError("   - Raw Auth Response: \(String(data: responseData, encoding: .utf8) ?? "Invalid UTF-8 data")")
-                DispatchQueue.main.async { completion(false) }; return
+            } catch {
+                self.logError("Legacy Auth failed: Could not decode response.")
+                DispatchQueue.main.async { completion(false) }
             }
-            // --- End JSON Decoding ---
-            
-        }.resume() // Start the URLSessionDataTask.
+        }.resume()
     }
     
     // MARK: - Public API - Language Management
@@ -557,6 +431,9 @@ public class CMSCureSDK {
             }
         }
         
+        KingfisherManager.shared.cache.clearMemoryCache()
+        KingfisherManager.shared.cache.clearDiskCache()
+        
         // Clear the runtime configuration state.
         configQueue.sync { // Synchronous write to ensure config is nil after this call.
             self.configuration = nil
@@ -565,7 +442,7 @@ public class CMSCureSDK {
         if self.debugLogsEnabled { print("🧹 Cache, Tabs List, Config files, and runtime SDK configuration have been cleared.") }
         
         // Stop any active listening (socket connection).
-        stopListening() // Disconnects socket.
+//        stopListening() // Disconnects socket.
     }
     
     // MARK: - Public API - Content Accessors
@@ -580,16 +457,8 @@ public class CMSCureSDK {
     ///   - screenName: The name of the tab/screen where the translation key is located.
     /// - Returns: The translated string for the current language, or an empty string if not found.
     public func translation(for key: String, inTab screenName: String) -> String {
-        return cacheQueue.sync { // Thread-safe read from the cache.
-            let lang = self.currentLanguage
-            guard let tabCache = cache[screenName],
-                  let keyMap = tabCache[key],
-                  let translation = keyMap[lang] else {
-                // Optional: Log if a translation is missing. Can be noisy, so disabled by default.
-                // if debugLogsEnabled { print("⚠️ Translation missing for key '\(key)' in tab '\(screenName)' for language '\(lang)'.") }
-                return "" // Return empty string for missing translations as per existing behavior.
-            }
-            return translation
+        return cacheQueue.sync {
+            return cache[screenName]?[key]?[self.currentLanguage] ?? ""
         }
     }
     
@@ -601,16 +470,8 @@ public class CMSCureSDK {
     /// - Parameter key: The key for the desired color.
     /// - Returns: The color hex string (e.g., "#RRGGBB") or `nil` if not found.
     public func colorValue(for key: String) -> String? {
-        return cacheQueue.sync { // Thread-safe read from the cache.
-            // Colors are expected to be in a specific structure under the "__colors__" tab.
-            // The "language" for colors is often a fixed key like "color".
-            guard let colorTabCache = cache["__colors__"],
-                  let valueMap = colorTabCache[key],
-                  let colorHex = valueMap["color"] else { // Assuming "color" is the key for the hex value itself.
-                // if debugLogsEnabled { print("⚠️ Color missing for key '\(key)'.") }
-                return nil
-            }
-            return colorHex
+        return cacheQueue.sync {
+            return cache["__colors__"]?[key]?["color"]
         }
     }
     
@@ -625,14 +486,20 @@ public class CMSCureSDK {
     ///   - screenName: The name of the tab/screen where the image URL key is located.
     /// - Returns: A `URL` object if a valid URL string is found, otherwise `nil`.
     public func imageUrl(for key: String, inTab screenName: String) -> URL? {
-        // `self.translation` is already thread-safe.
         let urlString = self.translation(for: key, inTab: screenName)
+        guard !urlString.isEmpty, let url = URL(string: urlString) else { return nil }
+        return url
+    }
+    
+    /// Retrieves a URL for a globally managed image asset from the central image library.
+    public func imageURL(forKey: String) -> URL? {
+        let urlString = cacheQueue.sync {
+            // Global images are stored in the "__images__" virtual tab.
+            // The value is stored under the "url" key.
+            return self.cache["__images__"]?[forKey]?["url"]
+        }
         
-        guard !urlString.isEmpty, let url = URL(string: urlString) else {
-            if self.debugLogsEnabled && !urlString.isEmpty {
-                // Log only if a non-empty string was found but couldn't be parsed as a URL.
-                print("❌ Invalid URL format for image key '\(key)' in tab '\(screenName)'. Found: '\(urlString)'")
-            }
+        guard let urlStr = urlString, !urlStr.isEmpty, let url = URL(string: urlStr) else {
             return nil
         }
         return url
@@ -814,6 +681,72 @@ public class CMSCureSDK {
     ///   - completion: A closure called on the main thread with `true` if synchronization and cache update
     ///                 were successful, `false` otherwise.
     public func sync(screenName: String, completion: @escaping (Bool) -> Void) {
+        if screenName == "__images__" {
+            // Route to the new image syncing logic.
+            syncImages(completion: completion)
+        } else {
+            // Use existing logic for translations and colors.
+            syncTranslations(screenName: screenName, completion: completion)
+        }
+    }
+    
+    /// Fetches the list of all global image assets from the `/api/images/:projectId` endpoint.
+    private func syncImages(completion: @escaping (Bool) -> Void) {
+        guard let config = getCurrentConfiguration() else {
+            logError("Sync Images failed: SDK is not configured.")
+            DispatchQueue.main.async { completion(false) }; return
+        }
+        
+        // CORRECTED: Use the new SDK-specific endpoint. This is a GET request.
+        guard let request = createAuthenticatedRequest(
+            endpointPath: "/api/sdk/images/\(config.projectId)",
+            httpMethod: "GET",
+            useEncryption: false
+        ) else {
+            logError("Failed to create sync request for images.")
+            DispatchQueue.main.async { completion(false) }; return
+        }
+        
+        if debugLogsEnabled { print("🔄 Syncing global image assets from /api/sdk/images/...") }
+        
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self, let responseData = self.handleNetworkResponse(data: data, response: response, error: error, context: "syncing images") else {
+                DispatchQueue.main.async { completion(false) }; return
+            }
+            
+            struct ImageAsset: Decodable { let key: String; let url: String }
+            
+            do {
+                let imageAssets = try JSONDecoder().decode([ImageAsset].self, from: responseData)
+                if self.debugLogsEnabled { print("✅ Fetched \(imageAssets.count) image assets from server.") }
+                
+                self.cacheQueue.async(flags: .barrier) {
+                    var newImageCache: [String: [String: String]] = [:]
+                    for asset in imageAssets {
+                        newImageCache[asset.key] = ["url": asset.url]
+                    }
+                    self.cache["__images__"] = newImageCache
+                    self.saveCacheToDisk()
+                    
+                    let urlsToPrefetch = imageAssets.compactMap { URL(string: $0.url) }
+                    self.prefetchImages(urls: urlsToPrefetch)
+                    
+                    DispatchQueue.main.async {
+                        self.notifyUpdateHandlers(screenName: "__images__", values: [:])
+                        if self.debugLogsEnabled { print("✅ Synced and updated cache for __images__.") }
+                        completion(true)
+                    }
+                }
+            } catch {
+                self.logError("Failed to decode image assets JSON response: \(error)")
+                self.logError("Raw Data: \(String(data: responseData, encoding: .utf8) ?? "Invalid data")")
+                DispatchQueue.main.async { completion(false) }
+            }
+        }.resume()
+    }
+    
+    /// Fetches translations for a standard content tab or the `__colors__` tab.
+    private func syncTranslations(screenName: String, completion: @escaping (Bool) -> Void) {
         guard let config = getCurrentConfiguration() else {
             logError("Sync failed for tab '\(screenName)': SDK is not configured.")
             DispatchQueue.main.async { completion(false) }
@@ -905,6 +838,11 @@ public class CMSCureSDK {
                 }
                 
                 self.saveCacheToDisk() // Persist the entire cache.
+                let urlsToPrefetch = keysArray
+                    .compactMap { $0["values"] as? [String: String] }
+                    .flatMap { Array($0.values) }
+                    .compactMap { URL(string: $0) }
+                self.prefetchImages(urls: urlsToPrefetch)
                 
                 // --- Notify UI Handlers (on Main Thread) ---
                 DispatchQueue.main.async {
@@ -914,6 +852,23 @@ public class CMSCureSDK {
                 }
             } // End cacheQueue barrier task.
         }.resume() // Start the URLSessionDataTask.
+    }
+    
+    /// Uses Kingfisher to download and cache an array of image URLs in the background.
+    /// - Parameter urls: An array of `URL` objects to pre-fetch.
+    private func prefetchImages(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if debugLogsEnabled { print("🖼️ Kingfisher: Starting pre-fetch for \(urls.count) images.") }
+        
+        let prefetcher = ImagePrefetcher(urls: urls) { skipped, failed, completed in
+            if self.debugLogsEnabled {
+                print("🖼️ Kingfisher: Pre-fetch finished. Completed: \(completed.count), Failed: \(failed.count), Skipped: \(skipped.count)")
+                if !failed.isEmpty {
+                    self.logError("Kingfisher: Failed to pre-fetch \(failed.count) resources.")
+                }
+            }
+        }
+        prefetcher.start()
     }
     
     /// Triggers a synchronization operation for all known project tabs and special tabs (like `__colors__`).
@@ -949,7 +904,7 @@ public class CMSCureSDK {
             Array(Set(self.cache.keys).union(self.knownProjectTabs))
                 .filter { !$0.starts(with: "__") } // Example: Exclude tabs like "__colors__" from this generic list.
         }
-        let specialTabsToSync = ["__colors__"] // Always sync the special colors tab.
+        let specialTabsToSync = ["__colors__", "__images__"] // Always sync the special colors tab and images tab.
         
         let allTabsToSync = Set(regularTabsToSync + specialTabsToSync) // Use a Set to avoid duplicates.
         
@@ -1069,6 +1024,7 @@ public class CMSCureSDK {
         currentActiveSocket.off(clientEvent: .connect)
         currentActiveSocket.off("handshake_ack") // Custom event for handshake acknowledgement.
         currentActiveSocket.off("translationsUpdated") // Custom event for content updates.
+        currentActiveSocket.off("imagesUpdated")
         currentActiveSocket.off(clientEvent: .disconnect)
         currentActiveSocket.off(clientEvent: .error)
         currentActiveSocket.off(clientEvent: .reconnect)
@@ -1154,6 +1110,14 @@ public class CMSCureSDK {
             guard let self = self else { return }
             if self.debugLogsEnabled { print("📡 Received 'translationsUpdated' event from server. Data: \(data)") }
             self.handleSocketTranslationUpdate(data: data) // Process the update.
+        }
+        
+        // Handler for the 'imagesUpdated' event for the global image library.
+        currentActiveSocket.on("imagesUpdated") { [weak self] data, _ in
+            guard let self = self else { return }
+            if self.debugLogsEnabled { print("🖼️ Received 'imagesUpdated' event. Data: \(data)") }
+            // Trigger a sync specifically for the "__images__" content.
+            self.sync(screenName: "__images__") { _ in }
         }
         
         if debugLogsEnabled { print("👂✅ Socket event handlers setup complete.") }
@@ -1969,8 +1933,8 @@ public final class CureColor: ObservableObject {
 /// }
 /// ```
 public final class CureImage: ObservableObject {
-    private let key: String
-    private let tab: String
+    private let key: String?
+    private let tab: String?
     private var cancellable: AnyCancellable? = nil
     
     /// The current `URL` for the image. `@Published` for SwiftUI updates.
@@ -1984,10 +1948,23 @@ public final class CureImage: ObservableObject {
     public init(_ key: String, tab: String) {
         self.key = key
         self.tab = tab
-        // Set initial URL value.
-        self.value = Cure.shared.imageUrl(for: key, inTab: tab)
-        
-        // Subscribe to updates.
+        // Determine initial value based on whether it's a global asset or not
+        if tab == "__images__" {
+            self.value = Cure.shared.imageURL(forKey: key)
+        } else {
+            self.value = Cure.shared.imageUrl(for: key, inTab: tab)
+        }
+        subscribeToUpdates()
+    }
+    
+    /// Initializes a `CureImage` for a screen-independent, global image asset.
+    public convenience init(assetKey: String) {
+        // Use the special "__images__" tab to signify a global asset
+        self.init(assetKey, tab: "__images__")
+    }
+    
+    /// Subscribes to the central bridge to receive update notifications.
+    private func subscribeToUpdates() {
         cancellable = CureTranslationBridge.shared.$refreshToken
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -1997,9 +1974,15 @@ public final class CureImage: ObservableObject {
     
     /// Updates the image `value` (URL) by fetching the latest URL string from the SDK.
     private func updateValue() {
-        let newUrl = Cure.shared.imageUrl(for: key, inTab: tab)
-        if newUrl != self.value { // Only update if changed.
-            self.value = newUrl
+        // Differentiate update logic based on whether it's a global asset or a legacy one
+        if let tabName = self.tab, tabName == "__images__" {
+            // Update logic for global image assets
+            let newUrl = Cure.shared.imageURL(forKey: key ?? "default_image_url_not_set")
+            if newUrl != self.value { self.value = newUrl }
+        } else if let tabName = self.tab {
+            // Backward compatible update for screen-dependent URLs
+            let newUrl = Cure.shared.imageUrl(for: key ?? "default_image_url_not_set", inTab: tabName)
+            if newUrl != self.value { self.value = newUrl }
         }
     }
 }
