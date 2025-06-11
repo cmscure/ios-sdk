@@ -1024,7 +1024,6 @@ public class CMSCureSDK {
         currentActiveSocket.off(clientEvent: .connect)
         currentActiveSocket.off("handshake_ack") // Custom event for handshake acknowledgement.
         currentActiveSocket.off("translationsUpdated") // Custom event for content updates.
-        currentActiveSocket.off("imagesUpdated")
         currentActiveSocket.off(clientEvent: .disconnect)
         currentActiveSocket.off(clientEvent: .error)
         currentActiveSocket.off(clientEvent: .reconnect)
@@ -1110,14 +1109,6 @@ public class CMSCureSDK {
             guard let self = self else { return }
             if self.debugLogsEnabled { print("📡 Received 'translationsUpdated' event from server. Data: \(data)") }
             self.handleSocketTranslationUpdate(data: data) // Process the update.
-        }
-        
-        // Handler for the 'imagesUpdated' event for the global image library.
-        currentActiveSocket.on("imagesUpdated") { [weak self] data, _ in
-            guard let self = self else { return }
-            if self.debugLogsEnabled { print("🖼️ Received 'imagesUpdated' event. Data: \(data)") }
-            // Trigger a sync specifically for the "__images__" content.
-            self.sync(screenName: "__images__") { _ in }
         }
         
         if debugLogsEnabled { print("👂✅ Socket event handlers setup complete.") }
