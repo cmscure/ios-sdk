@@ -2,7 +2,7 @@
 
 [![Swift Package Manager compatible](https://img.shields.io/badge/Swift%20Package%20Manager-compatible-brightgreen.svg)](https://swift.org/package-manager/)
 [![Platform](https://img.shields.io/badge/platform-iOS%2013%2B-blue.svg)](https://developer.apple.com/ios/)
-[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.3)
+[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.4)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE.md)
 
 **CMSCureSDK** provides a seamless way to integrate your iOS application with the CMSCure platform. Manage and deliver dynamic content, translations, colors, and image assets to your app with real-time updates and powerful offline caching capabilities.
@@ -21,8 +21,8 @@
 
 ## Requirements
 
-* iOS 13.0+
-* Xcode 13.0+
+* iOS 14.0+
+* Xcode 16.0+
 * Swift 5.5+
 * An active CMSCure project and associated credentials.
 
@@ -57,7 +57,9 @@ struct YourAppNameApp: App {
             projectSecret: "YOUR_PROJECT_SECRET"
         )
         // Optional: Enable debug logs during development
+        #if DEBUG
         Cure.shared.debugLogsEnabled = true
+        #endif
     }
 
     var body: some Scene {
@@ -171,6 +173,19 @@ The `CureImage` property wrapper now supports both global and screen-dependent i
         KFImage(heroBanner.value)
     }
     ```
+**`CureDataStore`**
+Use `CureDataStore` wrapper to fetch and observe an entire collection of structured data
+
+```swift
+@StateObject private var productStore = CureDataStore(apiIdentifier: "products")
+
+//... in your view body
+List(productStore.items) { product in
+    // Access localized and non-localized fields
+    Text(product.data["name"]?.localizedString ?? "N/A")
+    Text("Price: \\(product.data["price"]?.doubleValue ?? 0.0)")
+}
+```
 
 ### `String.cure(tab:)` Extension
 For direct, reactive translation access within SwiftUI `Text` views.

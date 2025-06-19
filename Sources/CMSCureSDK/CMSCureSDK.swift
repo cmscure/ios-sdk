@@ -78,13 +78,16 @@ public class CMSCureSDK {
     
     /// A set of known "tab" or "screen" names associated with the project, loaded from disk or updated via sync/auth.
     private var knownProjectTabs: Set<String> = []
+    private var knownDataStoreIdentifiers: Set<String> = []
     /// An array representation of `knownProjectTabs`, used for persistence to disk.
     private var offlineTabList: [String] = []
+    private var offlineDataStoreList: [String] = []
     
     /// The in-memory cache for storing translations and color data.
     /// Structure: `[ScreenName: [Key: [LanguageCode: Value]]]`
     /// For colors (typically under `__colors__` screenName), the LanguageCode might be a generic identifier like "color".
     private var cache: [String: [String: [String: String]]] = [:]
+    private var dataStoreCache: [String: [DataStoreItem]] = [:]
     
     /// The currently active language code (e.g., "en", "fr") for retrieving translations.
     /// Defaults to "en". Persisted in `UserDefaults`.
@@ -96,29 +99,25 @@ public class CMSCureSDK {
     /// Default is `true`. Set to `false` for production releases to reduce console noise.
     public var debugLogsEnabled: Bool = true
     
+    /// A dictionary mapping screen names (tabs) to their respective update handlers.
+    /// These handlers are called when translations for a screen are updated.
+    private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
+    
+    
     // MARK: - Persistence File Paths
     // URLs for storing SDK data (cache, tabs, legacy config) in the app's Documents directory.
     
-    /// The file URL for the persisted content cache (`cache.json`).
-    private let cacheFilePath: URL = {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) // Ensure directory exists
-        return dir.appendingPathComponent("cache.json")
-    }()
-    
-    /// The file URL for the persisted list of known tabs (`tabs.json`).
-    private let tabsFilePath: URL = {
+    private func getSdkDirectory() -> URL {
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("tabs.json")
-    }()
+        return dir
+    }
     
-    /// The file URL for the persisted legacy configuration data, like auth tokens (`config.json`).
-    private let configFilePath: URL = {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("config.json")
-    }()
+    private lazy var cacheFilePath: URL = getSdkDirectory().appendingPathComponent("cache.json")
+    private lazy var tabsFilePath: URL = getSdkDirectory().appendingPathComponent("tabs.json")
+    private lazy var configFilePath: URL = getSdkDirectory().appendingPathComponent("config.json")
+    private lazy var dataStoreCacheFilePath: URL = getSdkDirectory().appendingPathComponent("dataStoreCache.json")
+    private lazy var dataStoreListFilePath: URL = getSdkDirectory().appendingPathComponent("dataStoreList.json")
     
     // MARK: - Synchronization & Networking
     
@@ -131,9 +130,7 @@ public class CMSCureSDK {
     /// The manager for the Socket.IO client, responsible for connection and configuration.
     private var manager: SocketManager?
     
-    /// A dictionary mapping screen names (tabs) to their respective update handlers.
-    /// These handlers are called when translations for a screen are updated.
-    private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
+   
     
     /// A flag indicating whether the legacy Socket.IO handshake has been acknowledged by the server.
     /// Accessed via `cacheQueue`.
@@ -161,6 +158,9 @@ public class CMSCureSDK {
         self.socketIOUrl = URL(string: socketIOURLString)!
         
         loadCacheFromDisk()
+        loadDataStoreCacheFromDisk()
+        loadOfflineTabListFromDisk()
+        loadDataStoreListFromDisk()
         self.currentLanguage = UserDefaults.standard.string(forKey: "selectedLanguage") ?? "en"
         
         if let savedLegacyConfig = readLegacyConfigFromDisk() {
@@ -299,8 +299,14 @@ public class CMSCureSDK {
                     let receivedTabs = authResult.tabs ?? []
                     self.knownProjectTabs = Set(receivedTabs)
                     self.offlineTabList = Array(receivedTabs)
-                    self.saveLegacyConfigToDisk(["authToken": receivedToken])
+                    
                     self.saveOfflineTabListToDisk()
+                    let receivedStores = authResult.stores ?? []
+                    self.knownDataStoreIdentifiers = Set(receivedStores)
+                    self.offlineDataStoreList = Array(receivedStores)
+                    self.saveDataStoreListToDisk()
+                    
+                    self.saveLegacyConfigToDisk(["authToken": receivedToken])
                     
                     DispatchQueue.main.async {
                         self.startListening()
@@ -401,8 +407,11 @@ public class CMSCureSDK {
         // Perform cache clearing and file deletion on the cacheQueue for thread safety.
         cacheQueue.async(flags: .barrier) { // Barrier task for exclusive write access.
             self.cache.removeAll()
+            self.dataStoreCache.removeAll()
             self.offlineTabList.removeAll()
+            self.offlineDataStoreList.removeAll()
             self.knownProjectTabs.removeAll()
+            self.knownDataStoreIdentifiers.removeAll()
             self.authToken = nil
             self.symmetricKey = nil
             self.apiSecret = nil
@@ -418,6 +427,12 @@ public class CMSCureSDK {
                 }
                 if FileManager.default.fileExists(atPath: self.configFilePath.path) {
                     try FileManager.default.removeItem(at: self.configFilePath)
+                }
+                if FileManager.default.fileExists(atPath: self.dataStoreCacheFilePath.path) { // --- ADD THIS BLOCK ---
+                    try FileManager.default.removeItem(at: self.dataStoreCacheFilePath)
+                }
+                if FileManager.default.fileExists(atPath: self.dataStoreListFilePath.path) { // --- ADD THIS BLOCK ---
+                    try FileManager.default.removeItem(at: self.dataStoreListFilePath)
                 }
             } catch {
                 self.logError("Failed to delete one or more cache/config files during clearCache: \(error)")
@@ -460,6 +475,67 @@ public class CMSCureSDK {
         return cacheQueue.sync {
             return cache[screenName]?[key]?[self.currentLanguage] ?? ""
         }
+    }
+    
+    /// Retrieves all cached items for a specific Data Store.
+    /// This method is synchronous and reads directly from the in-memory cache.
+    /// Returns an empty array if the store is not found in the cache.
+    /// - Parameter apiIdentifier: The unique API identifier of the store.
+    /// - Returns: An array of `DataStoreItem` objects.
+    public func getStoreItems(for apiIdentifier: String) -> [DataStoreItem] { // --- ADD THIS ENTIRE METHOD ---
+        return cacheQueue.sync {
+            return self.dataStoreCache[apiIdentifier] ?? []
+        }
+    }
+    
+    /// Fetches the latest items for a specific Data Store from the backend and updates the cache.
+    /// - Parameters:
+    ///   - apiIdentifier: The unique API identifier of the store to synchronize.
+    ///   - completion: A closure called on the main thread with `true` on success, `false` on failure.
+    public func syncStore(apiIdentifier: String, completion: @escaping (Bool) -> Void) { // --- ADD THIS ENTIRE METHOD ---
+        guard let config = getCurrentConfiguration() else {
+            logError("Sync Store failed for '\(apiIdentifier)': SDK is not configured.")
+            DispatchQueue.main.async { completion(false) }; return
+        }
+        
+        // Use the standard authenticated request builder for the SDK endpoint
+        guard let request = createAuthenticatedRequest(
+            endpointPath: "/api/sdk/store/\(config.projectId)/\(apiIdentifier)",
+            httpMethod: "GET",
+            useEncryption: false
+        ) else {
+            logError("Failed to create sync request for data store '\(apiIdentifier)'.")
+            DispatchQueue.main.async { completion(false) }; return
+        }
+        
+        if debugLogsEnabled { print("🔄 Syncing data store '\(apiIdentifier)'...") }
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self, let responseData = self.handleNetworkResponse(data: data, response: response, error: error, context: "syncing data store '\(apiIdentifier)'") else {
+                DispatchQueue.main.async { completion(false) }; return
+            }
+            
+            var items: [DataStoreItem] = []
+            
+            do {
+                let decodedResponse = try JSONDecoder().decode(DataStoreResponse.self, from: responseData)
+                items = decodedResponse.items
+                self.cacheQueue.async(flags: .barrier) {
+                    // Update the dedicated data store cache
+                    self.dataStoreCache[apiIdentifier] = decodedResponse.items
+                    self.saveDataStoreCacheToDisk()
+                    
+                    DispatchQueue.main.async {
+                        if self.debugLogsEnabled { print("✅ Synced and updated cache for data store '\(apiIdentifier)'.") }
+                        self.postTranslationsUpdatedNotification(screenName: apiIdentifier)
+                        completion(true)
+                    }
+                }
+            } catch {
+                self.logError("Failed to decode data store response for '\(apiIdentifier)': \(error)")
+                DispatchQueue.main.async { completion(false) }
+            }
+        }.resume()
     }
     
     /// Retrieves a color hex string for a given global color key.
@@ -841,6 +917,7 @@ public class CMSCureSDK {
                 let urlsToPrefetch = keysArray
                     .compactMap { $0["values"] as? [String: String] }
                     .flatMap { Array($0.values) }
+                    .filter { $0.hasPrefix("http") }
                     .compactMap { URL(string: $0) }
                 self.prefetchImages(urls: urlsToPrefetch)
                 
@@ -925,6 +1002,14 @@ public class CMSCureSDK {
                     print("⚠️ Failed to sync tab '\(tabName)' during `syncIfOutdated` operation.")
                 }
             }
+        }
+        
+        let storesToSync = self.cacheQueue.sync { self.knownDataStoreIdentifiers }
+        if self.debugLogsEnabled && !storesToSync.isEmpty {
+            print("🔄 Syncing all known data stores: \(storesToSync.joined(separator: ", "))")
+        }
+        for storeIdentifier in storesToSync {
+            self.syncStore(apiIdentifier: storeIdentifier) { _ in }
         }
     }
     
@@ -1024,6 +1109,7 @@ public class CMSCureSDK {
         currentActiveSocket.off(clientEvent: .connect)
         currentActiveSocket.off("handshake_ack") // Custom event for handshake acknowledgement.
         currentActiveSocket.off("translationsUpdated") // Custom event for content updates.
+        currentActiveSocket.off("dataStoreUpdated")
         currentActiveSocket.off(clientEvent: .disconnect)
         currentActiveSocket.off(clientEvent: .error)
         currentActiveSocket.off(clientEvent: .reconnect)
@@ -1109,6 +1195,24 @@ public class CMSCureSDK {
             guard let self = self else { return }
             if self.debugLogsEnabled { print("📡 Received 'translationsUpdated' event from server. Data: \(data)") }
             self.handleSocketTranslationUpdate(data: data) // Process the update.
+        }
+        
+        currentActiveSocket.on("dataStoreUpdated") { [weak self] data, ack in
+            guard let self = self,
+                  let payload = data[0] as? [String: Any],
+                  let storeApiIdentifier = payload["storeApiIdentifier"] as? String else {
+                return
+            }
+            
+            if self.debugLogsEnabled { print("📡 Received 'dataStoreUpdated' event for store: '\(storeApiIdentifier)'. Triggering sync.") }
+            
+            // --- ENHANCEMENT 3: The socket event now triggers a sync. ---
+            // The sync function will, upon completion, post a global notification
+            // that all Cure observable objects (including CureDataStore) listen to.
+            self.syncStore(apiIdentifier: storeApiIdentifier) { success in
+                // The update is now handled automatically by the CureDataStore object's subscription.
+                // No need to manually call a specific handler here.
+            }
         }
         
         if debugLogsEnabled { print("👂✅ Socket event handlers setup complete.") }
@@ -1277,6 +1381,50 @@ public class CMSCureSDK {
             // if debugLogsEnabled { print("💾 Content cache saved to disk at \(self.cacheFilePath.lastPathComponent).") }
         } catch {
             logError("Failed to save content cache to disk: \(error)")
+        }
+    }
+    
+    private func saveDataStoreListToDisk() {
+            let listToSave = self.offlineDataStoreList
+            do {
+                let encodedData = try JSONEncoder().encode(listToSave)
+                try encodedData.write(to: self.dataStoreListFilePath, options: .atomic)
+            } catch {
+                logError("Failed to save data store list to disk: \(error)")
+            }
+        }
+
+        private func loadDataStoreListFromDisk() {
+            guard FileManager.default.fileExists(atPath: self.dataStoreListFilePath.path) else { return }
+            do {
+                let data = try Data(contentsOf: self.dataStoreListFilePath)
+                self.offlineDataStoreList = try JSONDecoder().decode([String].self, from: data)
+                self.knownDataStoreIdentifiers = Set(self.offlineDataStoreList)
+            } catch {
+                logError("Failed to load or decode data store list from disk: \(error).")
+            }
+        }
+    
+    // In the "Persistence Layer" section, add these two new methods for saving and loading the data store cache:
+    private func saveDataStoreCacheToDisk() {
+        let cacheToSave = self.dataStoreCache
+        do {
+            let encodedData = try JSONEncoder().encode(cacheToSave)
+            try encodedData.write(to: self.dataStoreCacheFilePath, options: .atomic)
+        } catch {
+            logError("Failed to save data store cache to disk: \(error)")
+        }
+    }
+
+    private func loadDataStoreCacheFromDisk() {
+        guard FileManager.default.fileExists(atPath: self.dataStoreCacheFilePath.path) else { return }
+        do {
+            let data = try Data(contentsOf: self.dataStoreCacheFilePath)
+            self.dataStoreCache = try JSONDecoder().decode([String: [DataStoreItem]].self, from: data)
+            if debugLogsEnabled { print("📦 Data Store cache loaded successfully.") }
+        } catch {
+            logError("Failed to load or decode data store cache from disk: \(error). Removing if problematic.")
+            try? FileManager.default.removeItem(at: self.dataStoreCacheFilePath)
         }
     }
     
@@ -1654,6 +1802,7 @@ public class CMSCureSDK {
         let projectId: String?      // Project ID, for confirmation.
         let projectSecret: String?  // Project Secret, for confirmation or update.
         let tabs: [String]?         // An array of known tab names for the project.
+        let stores: [String]?
     }
     
     // MARK: - Deinitialization
@@ -1976,6 +2125,51 @@ public final class CureImage: ObservableObject {
             if newUrl != self.value { self.value = newUrl }
         }
     }
+    
+}
+
+public final class CureDataStore: ObservableObject {
+    private let apiIdentifier: String
+    private var cancellable: AnyCancellable?
+
+    /// The array of items from the Data Store. This property is `@Published`, so SwiftUI
+    /// views will automatically update when the array changes.
+    @Published public private(set) var items: [DataStoreItem] = []
+
+    /// Initializes a `CureDataStore` object.
+    /// - Parameter apiIdentifier: The unique API identifier of the store to fetch and observe.
+    public init(apiIdentifier: String) {
+        self.apiIdentifier = apiIdentifier
+
+        // Set initial value from the SDK's cache
+        self.items = Cure.shared.getStoreItems(for: apiIdentifier)
+        
+        // Automatically trigger a sync when the object is created.
+        Cure.shared.syncStore(apiIdentifier: apiIdentifier) { _ in
+            // The sink subscription below will handle the update.
+            // This closure can be used for logging if needed.
+        }
+
+        // Subscribe to the .cmscureDataStoreDidUpdate notification
+        cancellable = CureTranslationBridge.shared.$refreshToken
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                // When any content in the SDK updates, this object will re-check
+                // its own data from the central cache.
+                self?.updateItems()
+            }
+    }
+
+    /// Fetches the latest items from the SDK's cache and updates the `items` property if changed.
+    private func updateItems() {
+        let newItems = Cure.shared.getStoreItems(for: self.apiIdentifier)
+        
+        // To prevent unnecessary UI updates, only update if the items have actually changed.
+        // This requires DataStoreItem to conform to Equatable.
+        if newItems != self.items {
+            self.items = newItems
+        }
+    }
 }
 
 // MARK: - NEW: Public SDKImage View
@@ -2032,5 +2226,100 @@ extension SocketIOStatus {
         case .connecting:   return "Connecting"
         case .connected:    return "Connected"
         }
+    }
+}
+
+public enum JSONValue: Codable, Equatable, Hashable {
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+    // --- NEW CASE to handle localized strings ---
+    case localizedObject([String: String])
+    case null
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .int(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .double(value)
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        // --- NEW: Handle decoding of the language dictionary ---
+        } else if let value = try? container.decode([String: String].self) {
+            self = .localizedObject(value)
+        } else if container.decodeNil() {
+            self = .null
+        } else {
+            throw DecodingError.typeMismatch(JSONValue.self, .init(codingPath: decoder.codingPath, debugDescription: "Unsupported JSON type"))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let v): try container.encode(v)
+        case .int(let v): try container.encode(v)
+        case .double(let v): try container.encode(v)
+        case .bool(let v): try container.encode(v)
+        // --- NEW: Handle encoding of the language dictionary ---
+        case .localizedObject(let v): try container.encode(v)
+        case .null: try container.encodeNil()
+        }
+    }
+}
+
+public struct DataStoreItem: Codable, Equatable, Hashable, Identifiable {
+    public let id: String
+    public let data: [String: JSONValue]
+    public let createdAt: String
+    public let updatedAt: String
+    private enum CodingKeys: String, CodingKey { case id = "_id", data, createdAt, updatedAt }
+}
+
+private struct DataStoreResponse: Codable { let items: [DataStoreItem] }
+
+
+/// Helper extension to easily and safely extract typed values from the JSONValue enum.
+public extension JSONValue {
+    /// Returns the string value if the case is `.string`, otherwise nil.
+    var stringValue: String? {
+        if case .string(let val) = self { return val }
+        return nil
+    }
+    
+    /// Returns the boolean value if the case is `.bool`, otherwise nil.
+    var boolValue: Bool? {
+        if case .bool(let val) = self { return val }
+        return nil
+    }
+    
+    /// Returns the integer value if the case is `.int`, otherwise nil.
+    var intValue: Int? {
+        if case .int(let val) = self { return val }
+        return nil
+    }
+    
+    /// Returns the double value if the case is `.double`, otherwise nil.
+    var doubleValue: Double? {
+        if case .double(let val) = self { return val }
+        return nil
+    }
+    
+    /// Returns the string for the SDK's currently active language if the value is a
+    /// localized object. Falls back to the default language or the first available
+    /// language if the active one isn't present.
+    var localizedString: String? {
+        guard case .localizedObject(let dict) = self else {
+            // If the field is not a localized object, it might be a regular string.
+            // This provides backward compatibility.
+            return self.stringValue
+        }
+        let currentLang = Cure.shared.getLanguage()
+        // Prioritize current language, then English as a fallback, then any available language.
+        return dict[currentLang] ?? dict["en"] ?? dict.values.first
     }
 }
