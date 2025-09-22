@@ -108,9 +108,21 @@ public class CMSCureSDK {
     // URLs for storing SDK data (cache, tabs, legacy config) in the app's Documents directory.
     
     private func getSdkDirectory() -> URL {
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CMSCureSDK")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        let fileManager = FileManager.default
+        let baseDirectory = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        var sdkDirectory = baseDirectory.appendingPathComponent("CMSCureSDK", isDirectory: true)
+        
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        
+        do {
+            try fileManager.createDirectory(at: sdkDirectory, withIntermediateDirectories: true)
+            try sdkDirectory.setResourceValues(resourceValues)
+        } catch {
+            logError("Failed to prepare CMSCureSDK cache directory: \(error)")
+        }
+        
+        return sdkDirectory
     }
     
     private lazy var cacheFilePath: URL = getSdkDirectory().appendingPathComponent("cache.json")
@@ -130,7 +142,7 @@ public class CMSCureSDK {
     /// The manager for the Socket.IO client, responsible for connection and configuration.
     private var manager: SocketManager?
     
-   
+    
     
     /// A flag indicating whether the legacy Socket.IO handshake has been acknowledged by the server.
     /// Accessed via `cacheQueue`.
@@ -457,7 +469,7 @@ public class CMSCureSDK {
         if self.debugLogsEnabled { print("🧹 Cache, Tabs List, Config files, and runtime SDK configuration have been cleared.") }
         
         // Stop any active listening (socket connection).
-//        stopListening() // Disconnects socket.
+        //        stopListening() // Disconnects socket.
     }
     
     // MARK: - Public API - Content Accessors
@@ -509,7 +521,7 @@ public class CMSCureSDK {
         }
         
         if debugLogsEnabled { print("🔄 Syncing data store '\(apiIdentifier)'...") }
-
+        
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self, let responseData = self.handleNetworkResponse(data: data, response: response, error: error, context: "syncing data store '\(apiIdentifier)'") else {
                 DispatchQueue.main.async { completion(false) }; return
@@ -1385,25 +1397,25 @@ public class CMSCureSDK {
     }
     
     private func saveDataStoreListToDisk() {
-            let listToSave = self.offlineDataStoreList
-            do {
-                let encodedData = try JSONEncoder().encode(listToSave)
-                try encodedData.write(to: self.dataStoreListFilePath, options: .atomic)
-            } catch {
-                logError("Failed to save data store list to disk: \(error)")
-            }
+        let listToSave = self.offlineDataStoreList
+        do {
+            let encodedData = try JSONEncoder().encode(listToSave)
+            try encodedData.write(to: self.dataStoreListFilePath, options: .atomic)
+        } catch {
+            logError("Failed to save data store list to disk: \(error)")
         }
-
-        private func loadDataStoreListFromDisk() {
-            guard FileManager.default.fileExists(atPath: self.dataStoreListFilePath.path) else { return }
-            do {
-                let data = try Data(contentsOf: self.dataStoreListFilePath)
-                self.offlineDataStoreList = try JSONDecoder().decode([String].self, from: data)
-                self.knownDataStoreIdentifiers = Set(self.offlineDataStoreList)
-            } catch {
-                logError("Failed to load or decode data store list from disk: \(error).")
-            }
+    }
+    
+    private func loadDataStoreListFromDisk() {
+        guard FileManager.default.fileExists(atPath: self.dataStoreListFilePath.path) else { return }
+        do {
+            let data = try Data(contentsOf: self.dataStoreListFilePath)
+            self.offlineDataStoreList = try JSONDecoder().decode([String].self, from: data)
+            self.knownDataStoreIdentifiers = Set(self.offlineDataStoreList)
+        } catch {
+            logError("Failed to load or decode data store list from disk: \(error).")
         }
+    }
     
     // In the "Persistence Layer" section, add these two new methods for saving and loading the data store cache:
     private func saveDataStoreCacheToDisk() {
@@ -1415,7 +1427,7 @@ public class CMSCureSDK {
             logError("Failed to save data store cache to disk: \(error)")
         }
     }
-
+    
     private func loadDataStoreCacheFromDisk() {
         guard FileManager.default.fileExists(atPath: self.dataStoreCacheFilePath.path) else { return }
         do {
@@ -1785,9 +1797,9 @@ public class CMSCureSDK {
     /// Debug messages are only printed if `debugLogsEnabled` is `true` AND the build configuration is DEBUG.
     /// - Parameter message: The debug message to log.
     internal func logDebug(_ message: String) {
-// Only print debug logs if the flag is enabled.
+        // Only print debug logs if the flag is enabled.
         guard debugLogsEnabled else { return }
-// Additionally, you might only want these in actual DEBUG builds.
+        // Additionally, you might only want these in actual DEBUG builds.
 #if DEBUG
         print("🛠️ [CMSCureSDK Debug] \(message)")
 #endif
@@ -1873,37 +1885,37 @@ public enum CMSCureSDKError: Error, LocalizedError { // Made public and conformi
     
     public var errorDescription: String? {
         switch self {
-        case .notConfigured:
-            return "CMSCureSDK has not been configured. Please call CMSCureSDK.shared.configure() first."
-        case .missingInitialCredentials(let detail):
-            return "CMSCureSDK configuration failed: \(detail)."
-        case .missingRequiredSecretsForOperation(let operation):
-            return "CMSCureSDK operation '\(operation)' failed: Required secrets (e.g., symmetric key) are missing."
-        case .invalidURL(let urlString):
-            return "Invalid URL provided: \(urlString)."
-        case .invalidResponse:
-            return "Received an invalid or unexpected response from the server."
-        case .decodingFailed(let error, let rawData):
-            let dataHint = rawData.flatMap { String(data: $0, encoding: .utf8) } ?? "No raw data"
-            return "Failed to decode server response. Error: \(error.localizedDescription). Raw data snippet: \(dataHint.prefix(100))."
-        case .syncFailed(let tabName, let underlyingError):
-            return "Synchronization failed for tab '\(tabName)'." + (underlyingError != nil ? " Details: \(underlyingError!.localizedDescription)" : "")
-        case .socketConnectionFailed(let error):
-            return "Socket.IO connection failed." + (error != nil ? " Error: \(error!.localizedDescription)" : "")
-        case .socketDisconnected(let reason):
-            return "Socket.IO connection was disconnected." + (reason != nil ? " Reason: \(reason!)" : "")
-        case .socketHandshakeFailed:
-            return "Socket.IO handshake with the server failed."
-        case .encryptionFailed(let error):
-            return "Data encryption or decryption failed." + (error != nil ? " Error: \(error!.localizedDescription)" : "")
-        case .configurationError(let message):
-            return "SDK Configuration Error: \(message)."
-        case .authenticationFailed(let message):
-            return "Authentication failed." + (message != nil ? " Details: \(message!)" : "")
-        case .networkError(let error):
-            return "A network error occurred: \(error.localizedDescription)."
-        case .serverError(let statusCode, let message, _):
-            return "Server returned an error: Status Code \(statusCode)." + (message != nil ? " Message: \(message!)" : "")
+            case .notConfigured:
+                return "CMSCureSDK has not been configured. Please call CMSCureSDK.shared.configure() first."
+            case .missingInitialCredentials(let detail):
+                return "CMSCureSDK configuration failed: \(detail)."
+            case .missingRequiredSecretsForOperation(let operation):
+                return "CMSCureSDK operation '\(operation)' failed: Required secrets (e.g., symmetric key) are missing."
+            case .invalidURL(let urlString):
+                return "Invalid URL provided: \(urlString)."
+            case .invalidResponse:
+                return "Received an invalid or unexpected response from the server."
+            case .decodingFailed(let error, let rawData):
+                let dataHint = rawData.flatMap { String(data: $0, encoding: .utf8) } ?? "No raw data"
+                return "Failed to decode server response. Error: \(error.localizedDescription). Raw data snippet: \(dataHint.prefix(100))."
+            case .syncFailed(let tabName, let underlyingError):
+                return "Synchronization failed for tab '\(tabName)'." + (underlyingError != nil ? " Details: \(underlyingError!.localizedDescription)" : "")
+            case .socketConnectionFailed(let error):
+                return "Socket.IO connection failed." + (error != nil ? " Error: \(error!.localizedDescription)" : "")
+            case .socketDisconnected(let reason):
+                return "Socket.IO connection was disconnected." + (reason != nil ? " Reason: \(reason!)" : "")
+            case .socketHandshakeFailed:
+                return "Socket.IO handshake with the server failed."
+            case .encryptionFailed(let error):
+                return "Data encryption or decryption failed." + (error != nil ? " Error: \(error!.localizedDescription)" : "")
+            case .configurationError(let message):
+                return "SDK Configuration Error: \(message)."
+            case .authenticationFailed(let message):
+                return "Authentication failed." + (message != nil ? " Details: \(message!)" : "")
+            case .networkError(let error):
+                return "A network error occurred: \(error.localizedDescription)."
+            case .serverError(let statusCode, let message, _):
+                return "Server returned an error: Status Code \(statusCode)." + (message != nil ? " Message: \(message!)" : "")
         }
     }
 }
@@ -2131,16 +2143,16 @@ public final class CureImage: ObservableObject {
 public final class CureDataStore: ObservableObject {
     private let apiIdentifier: String
     private var cancellable: AnyCancellable?
-
+    
     /// The array of items from the Data Store. This property is `@Published`, so SwiftUI
     /// views will automatically update when the array changes.
     @Published public private(set) var items: [DataStoreItem] = []
-
+    
     /// Initializes a `CureDataStore` object.
     /// - Parameter apiIdentifier: The unique API identifier of the store to fetch and observe.
     public init(apiIdentifier: String) {
         self.apiIdentifier = apiIdentifier
-
+        
         // Set initial value from the SDK's cache
         self.items = Cure.shared.getStoreItems(for: apiIdentifier)
         
@@ -2149,7 +2161,7 @@ public final class CureDataStore: ObservableObject {
             // The sink subscription below will handle the update.
             // This closure can be used for logging if needed.
         }
-
+        
         // Subscribe to the .cmscureDataStoreDidUpdate notification
         cancellable = CureTranslationBridge.shared.$refreshToken
             .receive(on: DispatchQueue.main)
@@ -2159,7 +2171,7 @@ public final class CureDataStore: ObservableObject {
                 self?.updateItems()
             }
     }
-
+    
     /// Fetches the latest items from the SDK's cache and updates the `items` property if changed.
     private func updateItems() {
         let newItems = Cure.shared.getStoreItems(for: self.apiIdentifier)
@@ -2190,14 +2202,14 @@ public extension Cure {
     /// ```
     struct SDKImage: View {
         private let url: URL?
-
+        
         /// Initializes the view with a URL.
         /// - Parameter url: The URL of the image to display, typically retrieved from
         ///   `Cure.shared.imageURL(forKey:)` or `Cure.shared.imageUrl(for:inTab:)`.
         public init(url: URL?) {
             self.url = url
         }
-
+        
         public var body: some View {
             // Internally, this view uses KFImage to leverage its powerful features.
             // The app developer does not need to know about or import Kingfisher.
@@ -2221,10 +2233,10 @@ extension SocketIOStatus {
     /// Provides a user-friendly string description for each `SocketIOStatus` case.
     internal var description: String { // Made internal as it's primarily for SDK's own logging.
         switch self {
-        case .notConnected: return "Not Connected"
-        case .disconnected: return "Disconnected"
-        case .connecting:   return "Connecting"
-        case .connected:    return "Connected"
+            case .notConnected: return "Not Connected"
+            case .disconnected: return "Disconnected"
+            case .connecting:   return "Connecting"
+            case .connected:    return "Connected"
         }
     }
 }
@@ -2237,7 +2249,7 @@ public enum JSONValue: Codable, Equatable, Hashable {
     // --- NEW CASE to handle localized strings ---
     case localizedObject([String: String])
     case null
-
+    
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let value = try? container.decode(String.self) {
@@ -2248,7 +2260,7 @@ public enum JSONValue: Codable, Equatable, Hashable {
             self = .double(value)
         } else if let value = try? container.decode(Bool.self) {
             self = .bool(value)
-        // --- NEW: Handle decoding of the language dictionary ---
+            // --- NEW: Handle decoding of the language dictionary ---
         } else if let value = try? container.decode([String: String].self) {
             self = .localizedObject(value)
         } else if container.decodeNil() {
@@ -2257,17 +2269,17 @@ public enum JSONValue: Codable, Equatable, Hashable {
             throw DecodingError.typeMismatch(JSONValue.self, .init(codingPath: decoder.codingPath, debugDescription: "Unsupported JSON type"))
         }
     }
-
+    
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
-        case .string(let v): try container.encode(v)
-        case .int(let v): try container.encode(v)
-        case .double(let v): try container.encode(v)
-        case .bool(let v): try container.encode(v)
-        // --- NEW: Handle encoding of the language dictionary ---
-        case .localizedObject(let v): try container.encode(v)
-        case .null: try container.encodeNil()
+            case .string(let v): try container.encode(v)
+            case .int(let v): try container.encode(v)
+            case .double(let v): try container.encode(v)
+            case .bool(let v): try container.encode(v)
+                // --- NEW: Handle encoding of the language dictionary ---
+            case .localizedObject(let v): try container.encode(v)
+            case .null: try container.encodeNil()
         }
     }
 }
