@@ -53,6 +53,15 @@ public class CMSCureSDK {
         let projectId: String       /// The unique identifier for your project in CMSCure.
         let apiKey: String          /// The API key used for authenticating requests with the CMSCure backend.
         let projectSecret: String   /// The secret key associated with your project, used for legacy encryption and handshake validation.
+        let enableAutoRealTimeUpdates: Bool /// Whether to automatically enable real-time updates for screens accessed via translation() method. Default: true
+        
+        /// Convenience initializer with auto real-time updates enabled by default
+        public init(projectId: String, apiKey: String, projectSecret: String, enableAutoRealTimeUpdates: Bool = true) {
+            self.projectId = projectId
+            self.apiKey = apiKey
+            self.projectSecret = projectSecret
+            self.enableAutoRealTimeUpdates = enableAutoRealTimeUpdates
+        }
     }
     
     /// Holds the active SDK configuration. This is `nil` until `configure()` is successfully called.
@@ -102,6 +111,26 @@ public class CMSCureSDK {
     /// A dictionary mapping screen names (tabs) to their respective update handlers.
     /// These handlers are called when translations for a screen are updated.
     private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
+    
+    /// Auto-subscription tracking: Keeps track of screens accessed via translation() method.
+    /// This enables automatic real-time updates for screens that are actively being used.
+    private var autoSubscribedScreens: Set<String> = []
+    
+    /// Auto-subscription tracking for colors: Keeps track when colorValue() is called.
+    /// This enables automatic real-time updates for colors that are actively being used.
+    private var autoSubscribedColors: Bool = false
+    
+    /// Auto-subscription tracking for global images: Keeps track when imageURL() is called.
+    /// This enables automatic real-time updates for global images that are actively being used.
+    private var autoSubscribedGlobalImages: Bool = false
+    
+    /// Auto-subscription tracking for data stores: Keeps track of stores accessed via getStoreItems().
+    /// This enables automatic real-time updates for data stores that are actively being used.
+    private var autoSubscribedDataStores: Set<String> = []
+    
+    /// Cache for the last returned values per key/screen combination.
+    /// This prevents unnecessary notifications when values haven't actually changed.
+    private var lastReturnedValues: [String: [String: String]] = [:] // [screenName: [key: lastValue]]
     
     
     // MARK: - Persistence File Paths
@@ -196,18 +225,17 @@ public class CMSCureSDK {
     ///   - projectId: Your unique Project ID from the CMSCure dashboard.
     ///   - apiKey: Your secret API Key from the CMSCure dashboard, used for authenticating API requests.
     ///   - projectSecret: Your Project Secret from the CMSCure dashboard, used for legacy encryption and socket handshake.
-    ///   - serverUrlString: The base URL string for your CMSCure backend API (e.g., "https://app.cmscure.com").
-    ///                      Defaults to "https://app.cmscure.com". Must use HTTPS in production.
-    ///   - socketIOURLString: The URL string for your CMSCure Socket.IO server (e.g., "wss://app.cmscure.com").
-    ///                        Defaults to "wss://app.cmscure.com". Must use WSS in production.
-    public func configure(projectId: String, apiKey: String, projectSecret: String) {
+    ///   - enableAutoRealTimeUpdates: Whether to automatically enable real-time updates for screens accessed via translation() method.
+    ///                                 When enabled, calling translation() automatically subscribes to real-time updates for that screen.
+    ///                                 Defaults to `true` for enhanced developer experience. Set to `false` for traditional behavior.
+    public func configure(projectId: String, apiKey: String, projectSecret: String, enableAutoRealTimeUpdates: Bool = true) {
         // Ensure configuration parameters are valid.
         guard !projectId.isEmpty else { logError("Configuration failed: Project ID cannot be empty."); return }
         guard !apiKey.isEmpty else { logError("Configuration failed: API Key cannot be empty."); return }
         guard !projectSecret.isEmpty else { logError("Configuration failed: Project Secret cannot be empty."); return }
         
         // Create the configuration object.
-        let newConfiguration = CureConfiguration(projectId: projectId, apiKey: apiKey, projectSecret: projectSecret)
+        let newConfiguration = CureConfiguration(projectId: projectId, apiKey: apiKey, projectSecret: projectSecret, enableAutoRealTimeUpdates: enableAutoRealTimeUpdates)
         
         var sdkAlreadyConfigured = false
         configQueue.sync {
@@ -398,6 +426,42 @@ public class CMSCureSDK {
         return cacheQueue.sync { self.currentLanguage }
     }
     
+    /// Returns whether automatic real-time updates are currently enabled.
+    /// This reflects the configuration setting provided during SDK initialization.
+    /// - Returns: `true` if auto real-time updates are enabled, `false` otherwise.
+    public func isAutoRealTimeUpdatesEnabled() -> Bool {
+        guard let config = getCurrentConfiguration() else { return false }
+        return config.enableAutoRealTimeUpdates
+    }
+    
+    /// Returns a list of screens that have been automatically subscribed to real-time updates.
+    /// This includes screens accessed via the translation() method when auto real-time updates are enabled.
+    /// - Returns: An array of screen names that are auto-subscribed to real-time updates.
+    public func getAutoSubscribedScreens() -> [String] {
+        return DispatchQueue.main.sync { Array(autoSubscribedScreens) }
+    }
+    
+    /// Returns whether colors have been automatically subscribed to real-time updates.
+    /// This reflects whether colorValue() has been called when auto real-time updates are enabled.
+    /// - Returns: `true` if colors are auto-subscribed to real-time updates, `false` otherwise.
+    public func isColorsAutoSubscribed() -> Bool {
+        return DispatchQueue.main.sync { autoSubscribedColors }
+    }
+    
+    /// Returns whether global images have been automatically subscribed to real-time updates.
+    /// This reflects whether imageURL() has been called when auto real-time updates are enabled.
+    /// - Returns: `true` if global images are auto-subscribed to real-time updates, `false` otherwise.
+    public func isGlobalImagesAutoSubscribed() -> Bool {
+        return DispatchQueue.main.sync { autoSubscribedGlobalImages }
+    }
+    
+    /// Returns a list of data stores that have been automatically subscribed to real-time updates.
+    /// This includes data stores accessed via the getStoreItems() method when auto real-time updates are enabled.
+    /// - Returns: An array of data store API identifiers that are auto-subscribed to real-time updates.
+    public func getAutoSubscribedDataStores() -> [String] {
+        return DispatchQueue.main.sync { Array(autoSubscribedDataStores) }
+    }
+    
     // MARK: - Public API - Cache Management
     
     /// Clears all cached data, persisted files (cache, tabs, config), and runtime configuration.
@@ -464,6 +528,12 @@ public class CMSCureSDK {
     
     /// Retrieves a translation for a specific key within a given tab (screen name), using the currently set language.
     ///
+    /// **Enhanced with Automatic Real-time Updates:**
+    /// - Maintains exact same method signature for backward compatibility
+    /// - Automatically subscribes to real-time updates for accessed screens
+    /// - Returns immediate cached values while setting up real-time subscriptions in background
+    /// - No breaking changes for existing implementations
+    ///
     /// If the translation is not found in the cache, an empty string is returned.
     /// This method is thread-safe.
     ///
@@ -472,17 +542,30 @@ public class CMSCureSDK {
     ///   - screenName: The name of the tab/screen where the translation key is located.
     /// - Returns: The translated string for the current language, or an empty string if not found.
     public func translation(for key: String, inTab screenName: String) -> String {
+        // Auto-subscribe to real-time updates for this screen (non-blocking)
+        self.autoSubscribeToScreen(screenName)
+        
         return cacheQueue.sync {
             return cache[screenName]?[key]?[self.currentLanguage] ?? ""
         }
     }
     
     /// Retrieves all cached items for a specific Data Store.
+    ///
+    /// **Enhanced with Automatic Real-time Updates:**
+    /// - Maintains exact same method signature for backward compatibility
+    /// - Automatically subscribes to real-time updates for accessed data stores
+    /// - Returns immediate cached values while setting up real-time subscriptions in background
+    /// - No breaking changes for existing implementations
+    ///
     /// This method is synchronous and reads directly from the in-memory cache.
     /// Returns an empty array if the store is not found in the cache.
     /// - Parameter apiIdentifier: The unique API identifier of the store.
     /// - Returns: An array of `DataStoreItem` objects.
-    public func getStoreItems(for apiIdentifier: String) -> [DataStoreItem] { // --- ADD THIS ENTIRE METHOD ---
+    public func getStoreItems(for apiIdentifier: String) -> [DataStoreItem] {
+        // Auto-subscribe to real-time updates for this data store (non-blocking)
+        self.autoSubscribeToDataStore(apiIdentifier)
+        
         return cacheQueue.sync {
             return self.dataStoreCache[apiIdentifier] ?? []
         }
@@ -540,12 +623,21 @@ public class CMSCureSDK {
     
     /// Retrieves a color hex string for a given global color key.
     ///
+    /// **Enhanced with Automatic Real-time Updates:**
+    /// - Maintains exact same method signature for backward compatibility
+    /// - Automatically subscribes to real-time updates for colors when called
+    /// - Returns immediate cached values while setting up real-time subscriptions in background
+    /// - No breaking changes for existing implementations
+    ///
     /// Colors are typically stored in a special tab named `__colors__`.
     /// If the color key is not found, `nil` is returned. This method is thread-safe.
     ///
     /// - Parameter key: The key for the desired color.
     /// - Returns: The color hex string (e.g., "#RRGGBB") or `nil` if not found.
     public func colorValue(for key: String) -> String? {
+        // Auto-subscribe to real-time updates for colors (non-blocking)
+        self.autoSubscribeToColors()
+        
         return cacheQueue.sync {
             return cache["__colors__"]?[key]?["color"]
         }
@@ -568,7 +660,19 @@ public class CMSCureSDK {
     }
     
     /// Retrieves a URL for a globally managed image asset from the central image library.
+    ///
+    /// **Enhanced with Automatic Real-time Updates:**
+    /// - Maintains exact same method signature for backward compatibility
+    /// - Automatically subscribes to real-time updates for global images when called
+    /// - Returns immediate cached values while setting up real-time subscriptions in background
+    /// - No breaking changes for existing implementations
+    ///
+    /// - Parameter forKey: The key for the desired global image asset.
+    /// - Returns: A URL for the global image, or `nil` if not found or invalid.
     public func imageURL(forKey: String) -> URL? {
+        // Auto-subscribe to real-time updates for global images (non-blocking)
+        self.autoSubscribeToGlobalImages()
+        
         let urlString = cacheQueue.sync {
             // Global images are stored in the "__images__" virtual tab.
             // The value is stored under the "url" key.
@@ -1615,6 +1719,218 @@ public class CMSCureSDK {
             // Call handler if values exist or if we know this tab has been synced (even if empty).
             if !currentValuesForScreen.isEmpty || self.isTabSynced(screenName) {
                 handler(currentValuesForScreen)
+            }
+        }
+    }
+    
+    /// Automatically subscribes to real-time updates for a screen accessed via translation() method.
+    /// This method is called internally and provides seamless real-time behavior without breaking changes.
+    ///
+    /// **Key Features:**
+    /// - Tracks accessed screens to avoid duplicate subscriptions
+    /// - Sets up minimal overhead background sync if not already synced
+    /// - Maintains performance by using intelligent subscription management
+    /// - Thread-safe and non-blocking for the translation() method
+    ///
+    /// - Parameter screenName: The name of the screen/tab to auto-subscribe
+    private func autoSubscribeToScreen(_ screenName: String) {
+        // Check if auto real-time updates are enabled in configuration
+        guard let config = getCurrentConfiguration(), config.enableAutoRealTimeUpdates else {
+            return // Auto real-time updates disabled, use traditional behavior
+        }
+        
+        // Use async dispatch to avoid blocking the translation() method
+        DispatchQueue.global(qos: .utility).async {
+            // Thread-safe check and update of auto-subscribed screens
+            var shouldSubscribe = false
+            DispatchQueue.main.sync {
+                if !self.autoSubscribedScreens.contains(screenName) {
+                    self.autoSubscribedScreens.insert(screenName)
+                    shouldSubscribe = true
+                }
+            }
+            
+            // Only proceed if this is the first time accessing this screen
+            guard shouldSubscribe else { return }
+            
+            // Set up real-time subscription for this screen
+            DispatchQueue.main.async {
+                // Check if there's already a handler for this screen
+                if self.translationUpdateHandlers[screenName] == nil {
+                    // Set up a minimal handler that just refreshes the internal cache
+                    self.onTranslationsUpdated(for: screenName) { [weak self] updatedTranslations in
+                        // This handler maintains real-time sync but doesn't need to do anything special
+                        // The translation() method will automatically get fresh data from the updated cache
+                        self?.logDebug("Auto-subscription: Screen '\(screenName)' updated with \(updatedTranslations.count) translations")
+                    }
+                }
+            }
+            
+            // Ensure the screen data is synced if not already
+            if !self.isTabSynced(screenName) {
+                DispatchQueue.main.async {
+                    self.sync(screenName: screenName) { success in
+                        if success {
+                            self.logDebug("Auto-subscription: Successfully synced screen '\(screenName)'")
+                        } else {
+                            self.logError("Auto-subscription: Failed to sync screen '\(screenName)'")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Automatically subscribes to real-time updates for colors accessed via colorValue() method.
+    /// This method is called internally and provides seamless real-time behavior without breaking changes.
+    ///
+    /// **Key Features:**
+    /// - Tracks color access to avoid duplicate subscriptions
+    /// - Sets up minimal overhead background sync if not already synced
+    /// - Maintains performance by using intelligent subscription management
+    /// - Thread-safe and non-blocking for the colorValue() method
+    private func autoSubscribeToColors() {
+        // Check if auto real-time updates are enabled in configuration
+        guard let config = getCurrentConfiguration(), config.enableAutoRealTimeUpdates else {
+            return // Auto real-time updates disabled, use traditional behavior
+        }
+        
+        // Use async dispatch to avoid blocking the colorValue() method
+        DispatchQueue.global(qos: .utility).async {
+            // Thread-safe check and update of auto-subscribed colors
+            var shouldSubscribe = false
+            DispatchQueue.main.sync {
+                if !self.autoSubscribedColors {
+                    self.autoSubscribedColors = true
+                    shouldSubscribe = true
+                }
+            }
+            
+            // Only proceed if this is the first time accessing colors
+            guard shouldSubscribe else { return }
+            
+            // Set up real-time subscription for colors (using __colors__ virtual screen)
+            DispatchQueue.main.async {
+                // Check if there's already a handler for colors
+                if self.translationUpdateHandlers["__colors__"] == nil {
+                    // Set up a minimal handler that just refreshes the internal cache
+                    self.onTranslationsUpdated(for: "__colors__") { [weak self] updatedColors in
+                        self?.logDebug("Auto-subscription: Colors updated with \(updatedColors.count) entries")
+                    }
+                }
+            }
+            
+            // Ensure colors are synced if not already
+            if !self.isTabSynced("__colors__") {
+                DispatchQueue.main.async {
+                    self.sync(screenName: "__colors__") { success in
+                        if success {
+                            self.logDebug("Auto-subscription: Successfully synced colors")
+                        } else {
+                            self.logError("Auto-subscription: Failed to sync colors")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Automatically subscribes to real-time updates for global images accessed via imageURL() method.
+    /// This method is called internally and provides seamless real-time behavior without breaking changes.
+    ///
+    /// **Key Features:**
+    /// - Tracks global image access to avoid duplicate subscriptions
+    /// - Sets up minimal overhead background sync if not already synced
+    /// - Maintains performance by using intelligent subscription management
+    /// - Thread-safe and non-blocking for the imageURL() method
+    private func autoSubscribeToGlobalImages() {
+        // Check if auto real-time updates are enabled in configuration
+        guard let config = getCurrentConfiguration(), config.enableAutoRealTimeUpdates else {
+            return // Auto real-time updates disabled, use traditional behavior
+        }
+        
+        // Use async dispatch to avoid blocking the imageURL() method
+        DispatchQueue.global(qos: .utility).async {
+            // Thread-safe check and update of auto-subscribed global images
+            var shouldSubscribe = false
+            DispatchQueue.main.sync {
+                if !self.autoSubscribedGlobalImages {
+                    self.autoSubscribedGlobalImages = true
+                    shouldSubscribe = true
+                }
+            }
+            
+            // Only proceed if this is the first time accessing global images
+            guard shouldSubscribe else { return }
+            
+            // Set up real-time subscription for global images (using __images__ virtual screen)
+            DispatchQueue.main.async {
+                // Check if there's already a handler for global images
+                if self.translationUpdateHandlers["__images__"] == nil {
+                    // Set up a minimal handler that just refreshes the internal cache
+                    self.onTranslationsUpdated(for: "__images__") { [weak self] updatedImages in
+                        self?.logDebug("Auto-subscription: Global images updated with \(updatedImages.count) entries")
+                    }
+                }
+            }
+            
+            // Ensure global images are synced if not already
+            if !self.isTabSynced("__images__") {
+                DispatchQueue.main.async {
+                    self.sync(screenName: "__images__") { success in
+                        if success {
+                            self.logDebug("Auto-subscription: Successfully synced global images")
+                        } else {
+                            self.logError("Auto-subscription: Failed to sync global images")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Automatically subscribes to real-time updates for data stores accessed via getStoreItems() method.
+    /// This method is called internally and provides seamless real-time behavior without breaking changes.
+    ///
+    /// **Key Features:**
+    /// - Tracks accessed data stores to avoid duplicate subscriptions
+    /// - Sets up minimal overhead background sync if not already synced
+    /// - Maintains performance by using intelligent subscription management
+    /// - Thread-safe and non-blocking for the getStoreItems() method
+    ///
+    /// - Parameter apiIdentifier: The unique API identifier of the data store to auto-subscribe
+    private func autoSubscribeToDataStore(_ apiIdentifier: String) {
+        // Check if auto real-time updates are enabled in configuration
+        guard let config = getCurrentConfiguration(), config.enableAutoRealTimeUpdates else {
+            return // Auto real-time updates disabled, use traditional behavior
+        }
+        
+        // Use async dispatch to avoid blocking the getStoreItems() method
+        DispatchQueue.global(qos: .utility).async {
+            // Thread-safe check and update of auto-subscribed data stores
+            var shouldSubscribe = false
+            DispatchQueue.main.sync {
+                if !self.autoSubscribedDataStores.contains(apiIdentifier) {
+                    self.autoSubscribedDataStores.insert(apiIdentifier)
+                    shouldSubscribe = true
+                }
+            }
+            
+            // Only proceed if this is the first time accessing this data store
+            guard shouldSubscribe else { return }
+            
+            // Data stores use their own real-time event system (dataStoreUpdated socket event)
+            // The SDK already handles this automatically, so we just ensure the store is synced
+            
+            // Ensure the data store is synced if not already
+            DispatchQueue.main.async {
+                self.syncStore(apiIdentifier: apiIdentifier) { success in
+                    if success {
+                        self.logDebug("Auto-subscription: Successfully synced data store '\(apiIdentifier)'")
+                    } else {
+                        self.logError("Auto-subscription: Failed to sync data store '\(apiIdentifier)'")
+                    }
+                }
             }
         }
     }
