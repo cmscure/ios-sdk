@@ -2,7 +2,7 @@
 
 [![Swift Package Manager compatible](https://img.shields.io/badge/Swift%20Package%20Manager-compatible-brightgreen.svg)](https://swift.org/package-manager/)
 [![Platform](https://img.shields.io/badge/platform-iOS%2013%2B-blue.svg)](https://developer.apple.com/ios/)
-[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.5)
+[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.6)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE.md)
 
 **CMSCureSDK** provides a seamless way to integrate your iOS application with the CMSCure platform. Manage and deliver dynamic content, translations, colors, and image assets to your app with **enhanced automatic real-time updates** and powerful offline caching capabilities.
@@ -46,7 +46,7 @@ CMSCureSDK is available through the Swift Package Manager.
     ```
     [https://github.com/cmscure/ios-sdk.git](https://github.com/cmscure/ios-sdk.git)
     ```
-3.  For "Dependency Rule," choose "Up to Next Major Version" and input `1.0.5`.
+3.  For "Dependency Rule," choose "Up to Next Major Version" and input `1.0.6`.
 4.  Click "Add Package." The SDK and its required dependency (Kingfisher) will be added to your project.
 5.  Select the `CMSCureSDK` library product and add it to your desired target(s).
 
