@@ -793,15 +793,10 @@ public class CMSCureSDK {
             return
         }
         
-        let requestBody: [String: Any] = [
-            "projectId": config.projectId,
-            "apiIdentifier": apiIdentifier
-        ]
-        
         guard let request = createAuthenticatedRequest(
             endpointPath: "/api/sdk/store/\(config.projectId)/\(apiIdentifier)",
-            httpMethod: "POST",
-            body: requestBody,
+            httpMethod: "GET",
+            body: nil,
             useEncryption: false
         ) else {
             logError("Failed to create sync request for data store '\(apiIdentifier)'.")
@@ -1245,12 +1240,10 @@ public class CMSCureSDK {
             return
         }
         
-        let requestBody: [String: Any] = ["projectId": config.projectId]
-        
         guard let request = createAuthenticatedRequest(
             endpointPath: "/api/sdk/images/\(config.projectId)",
-            httpMethod: "POST",
-            body: requestBody,
+            httpMethod: "GET",
+            body: nil,
             useEncryption: false
         ) else {
             logError("Failed to create sync request for images.")
