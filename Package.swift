@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "CMSCureSDK",
     platforms: [
-        .iOS(.v14)
+        .iOS(.v14),
+        .macOS(.v11)
     ],
     products: [
         .library(

@@ -864,7 +864,19 @@ public class CMSCureSDK {
         setupAutoRealTimeUpdates(for: "__colors__")
         
         return cacheQueue.sync {
-            return cache["__colors__"]?[key]?["color"]
+            guard let colorsCache = cache["__colors__"] else {
+                if debugLogsEnabled { print("🔍 No colors cache found") }
+                return nil
+            }
+            
+            // Look for the color in the cache structure: cache["__colors__"][key]["color"]
+            if let colorData = colorsCache[key]?["color"] {
+                if debugLogsEnabled { print("🎨 Found color for '\(key)': \(colorData)") }
+                return colorData
+            }
+            
+            if debugLogsEnabled { print("🔍 Color not found for key: '\(key)'") }
+            return nil
         }
     }
     
@@ -1169,12 +1181,10 @@ public class CMSCureSDK {
             return
         }
         
-        let requestBody: [String: Any] = ["projectId": config.projectId]
-        
         guard let request = createAuthenticatedRequest(
             endpointPath: "/api/sdk/colors/\(config.projectId)",
-            httpMethod: "POST",
-            body: requestBody,
+            httpMethod: "GET",
+            body: nil,
             useEncryption: false
         ) else {
             logError("Failed to create sync request for colors.")
@@ -1209,8 +1219,8 @@ public class CMSCureSDK {
                 self.cacheQueue.async(flags: .barrier) {
                     var newColorCache: [String: [String: String]] = [:]
                     for color in colors {
-                        // Match JS SDK structure - uses "hex" key
-                        newColorCache[color.key] = ["hex": color.value, "color": color.value]
+                        // Store colors with "color" key to maintain cache structure
+                        newColorCache[color.key] = ["color": color.value]
                     }
                     self.cache["__colors__"] = newColorCache
                     self.saveCacheToDisk()
