@@ -2,7 +2,7 @@
 
 [![Swift Package Manager compatible](https://img.shields.io/badge/Swift%20Package%20Manager-compatible-brightgreen.svg)](https://swift.org/package-manager/)
 [![Platform](https://img.shields.io/badge/platform-iOS%2013%2B-blue.svg)](https://developer.apple.com/ios/)
-[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.6)
+[![Release](https://img.shields.io/github/v/release/cmscure/ios-sdk.svg?label=version&logo=github)](https://github.com/cmscure/ios-sdk/releases/tag/1.0.7)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE.md)
 
 **CMSCureSDK** provides a seamless way to integrate your iOS application with the CMSCure platform. Manage and deliver dynamic content, translations, colors, and image assets to your app with **enhanced automatic real-time updates** and powerful offline caching capabilities.
@@ -46,7 +46,7 @@ CMSCureSDK is available through the Swift Package Manager.
     ```
     [https://github.com/cmscure/ios-sdk.git](https://github.com/cmscure/ios-sdk.git)
     ```
-3.  For "Dependency Rule," choose "Up to Next Major Version" and input `1.0.6`.
+3.  For "Dependency Rule," choose "Up to Next Major Version" and input `1.0.7`.
 4.  Click "Add Package." The SDK and its required dependency (Kingfisher) will be added to your project.
 5.  Select the `CMSCureSDK` library product and add it to your desired target(s).
 
@@ -186,19 +186,29 @@ let bannerURL: URL? = Cure.shared.imageUrl(for: "hero_banner_image", inTab: "hom
 
 ### Displaying Images for Offline Support
 
-To ensure images are cached and available offline, you **must use `KFImage` from the Kingfisher library** to display them. The SDK automatically pre-fetches and caches images in the background, and `KFImage` knows how to read from that cache.
+For SwiftUI, the easiest way to render CMS-driven images (with caching and automatic refreshes) is the new `Cure.ManagedImage` view. It internally leverages Kingfisher and understands the SDK cache.
 
 ```swift
-import Kingfisher // Make sure to import Kingfisher in your view files
+import CMSCureSDK
 
-// In your SwiftUI view...
-if let url = Cure.shared.imageURL(forKey: "logo_primary") {
-    KFImage(url)
-        .resizable()
-        .placeholder { ProgressView() } // Optional placeholder
-        .aspectRatio(contentMode: .fit)
+struct HeaderLogo: View {
+    var body: some View {
+        Cure.ManagedImage(
+            key: "logo_primary",
+            contentMode: .fit,
+            defaultImageName: "AppLogo" // Optional local fallback asset
+        )
+        .frame(width: 140, height: 60)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
 }
 ```
+
+- Pass `defaultImageName` to show a bundled asset (e.g., from your asset catalog) while the CMS image downloads, or if the key is missing.
+- Omit `defaultImageName` to fall back to the built-in placeholder.
+- Use the `tab` parameter when you need to render an image URL stored inside a specific translations screen instead of the global image library.
+
+For UIKit (or if you prefer manual control), you can still fetch the URL with `imageURL(forKey:)` and call `KFImage`/`Kingfisher` directly on your `UIImageView`.
 
 ## Real-time Updates
 
@@ -299,23 +309,31 @@ Text("Hello").background(appThemeBackground.value ?? .clear)
 ```
 
 **`CureImage`**
-The `CureImage` property wrapper now supports both global and screen-dependent images.
+The `CureImage` observable object still supports global and screen-dependent images.
+
+> 💡 **Tip:** Prefer the `Cure.ManagedImage` view for most SwiftUI layouts—it wraps `CureImage` and Kingfisher for you, including optional fallback assets.
 
 * **For Global Image Assets (Recommended):**
     ```swift
-    @StateObject var logo = CureImage(assetKey: "logo_primary")
-    
     var body: some View {
-        KFImage(logo.value) // Use KFImage for display
+        Cure.ManagedImage(
+            key: "logo_primary",
+            defaultImageName: "AppLogo"
+        )
+        .frame(width: 140, height: 60)
     }
     ```
 
 * **For Screen-Dependent Image URLs (Legacy):**
     ```swift
-    @StateObject var heroBanner = CureImage("hero_banner_main", tab: "home_assets")
-    
     var body: some View {
-        KFImage(heroBanner.value)
+        Cure.ManagedImage(
+            key: "hero_banner_main",
+            tab: "home_assets",
+            contentMode: .fill
+        )
+        .frame(height: 180)
+        .clipped()
     }
     ```
 **`CureDataStore`**

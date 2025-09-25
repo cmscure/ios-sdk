@@ -117,6 +117,10 @@ public class CMSCureSDK {
     /// A dictionary mapping screen names (tabs) to their respective update handlers.
     /// These handlers are called when translations for a screen are updated.
     private var translationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
+
+    /// Handlers managed internally by the SDK to support automatic updates.
+    /// Stored separately so integrator-provided handlers are not overridden.
+    private var internalTranslationUpdateHandlers: [String: ([String: String]) -> Void] = [:]
     
     /// Auto-subscription tracking: Keeps track of screens accessed via translation() method.
     /// This enables automatic real-time updates for screens that are actively being used.
@@ -643,7 +647,9 @@ public class CMSCureSDK {
             
             // Notify all handlers that their data is now empty.
             DispatchQueue.main.async {
-                for screenName in self.translationUpdateHandlers.keys {
+                let allHandlerKeys = Set(self.translationUpdateHandlers.keys)
+                    .union(self.internalTranslationUpdateHandlers.keys)
+                for screenName in allHandlerKeys {
                     self.notifyUpdateHandlers(screenName: screenName, values: [:])
                 }
             }
@@ -710,13 +716,11 @@ public class CMSCureSDK {
             
             // Mark this screen as registered
             self.autoRegisteredScreens.insert(screenName)
-            
-            // Register a handler that will trigger SwiftUI updates
-            self.onTranslationsUpdated(for: screenName) { [weak self] _ in
-                // When translations update, trigger SwiftUI refresh
-                DispatchQueue.main.async {
-                    CureTranslationBridge.shared.refreshToken = UUID()
-                }
+
+            // Register an internal handler to observe updates without overriding
+            // any handlers the app developer may have registered manually.
+            self.registerInternalTranslationHandler(for: screenName) { [weak self] updatedTranslations in
+                self?.logDebug("Auto-updates: Screen '\(screenName)' refreshed with \(updatedTranslations.count) keys")
             }
             
             // If the screen hasn't been synced yet, sync it now
@@ -2076,12 +2080,28 @@ public class CMSCureSDK {
     public func onTranslationsUpdated(for screenName: String, handler: @escaping ([String: String]) -> Void) {
         DispatchQueue.main.async { // Ensure handler registration and initial callback are on the main thread.
             self.translationUpdateHandlers[screenName] = handler
-            
+
             // Immediately provide current cached values to the new handler.
             let currentLanguageKey = self.getLanguage() // Thread-safe language get.
             let currentValuesForScreen = self.getCachedTranslations(for: screenName, language: currentLanguageKey) // Thread-safe cache get.
-            
+
             // Call handler if values exist or if we know this tab has been synced (even if empty).
+            if !currentValuesForScreen.isEmpty || self.isTabSynced(screenName) {
+                handler(currentValuesForScreen)
+            }
+        }
+    }
+
+    /// Registers the SDK's own handlers without interfering with integrator-provided handlers.
+    /// Mirrors the semantics of `onTranslationsUpdated` so internal logic can reuse it safely.
+    private func registerInternalTranslationHandler(for screenName: String, handler: @escaping ([String: String]) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            self.internalTranslationUpdateHandlers[screenName] = handler
+
+            let currentLanguageKey = self.getLanguage()
+            let currentValuesForScreen = self.getCachedTranslations(for: screenName, language: currentLanguageKey)
             if !currentValuesForScreen.isEmpty || self.isTabSynced(screenName) {
                 handler(currentValuesForScreen)
             }
@@ -2124,17 +2144,9 @@ public class CMSCureSDK {
             // Only proceed if this is the first time accessing this screen
             guard shouldSubscribe else { return }
             
-            // Set up real-time subscription for this screen
-            if self.translationUpdateHandlers[screenName] == nil {
-                // Set up a minimal handler that just refreshes the internal cache
-                self.onTranslationsUpdated(for: screenName) { [weak self] updatedTranslations in
-                    // This handler maintains real-time sync but doesn't need to do anything special
-                    // The translation() method will automatically get fresh data from the updated cache
-                    self?.logDebug("Auto-subscription: Screen '\(screenName)' updated with \(updatedTranslations.count) translations")
-                    
-                    // Force UI refresh by updating the bridge token
-                    CureTranslationBridge.shared.refreshToken = UUID()
-                }
+            // Set up real-time subscription for this screen using an internal handler
+            self.registerInternalTranslationHandler(for: screenName) { [weak self] updatedTranslations in
+                self?.logDebug("Auto-subscription: Screen '\(screenName)' updated with \(updatedTranslations.count) translations")
             }
             
             // Ensure the screen data is synced if not already
@@ -2174,10 +2186,9 @@ public class CMSCureSDK {
             
             guard shouldSubscribe else { return }
             
-            if self.translationUpdateHandlers["__colors__"] == nil {
-                self.onTranslationsUpdated(for: "__colors__") { [weak self] updatedColors in
+            if self.internalTranslationUpdateHandlers["__colors__"] == nil {
+                self.registerInternalTranslationHandler(for: "__colors__") { [weak self] updatedColors in
                     self?.logDebug("Auto-subscription: Colors updated with \(updatedColors.count) entries")
-                    CureTranslationBridge.shared.refreshToken = UUID()
                 }
             }
             
@@ -2217,10 +2228,9 @@ public class CMSCureSDK {
             
             guard shouldSubscribe else { return }
             
-            if self.translationUpdateHandlers["__images__"] == nil {
-                self.onTranslationsUpdated(for: "__images__") { [weak self] updatedImages in
+            if self.internalTranslationUpdateHandlers["__images__"] == nil {
+                self.registerInternalTranslationHandler(for: "__images__") { [weak self] updatedImages in
                     self?.logDebug("Auto-subscription: Global images updated with \(updatedImages.count) entries")
-                    CureTranslationBridge.shared.refreshToken = UUID()
                 }
             }
             
@@ -2307,7 +2317,10 @@ public class CMSCureSDK {
         
         if debugLogsEnabled { print("📬 Notifying registered handlers for tab '\(screenName)'. Values count: \(values.count)") }
         
-        // Call the specific handler registered for this screenName, if any.
+        // Allow the SDK's internal observers to react first.
+        self.internalTranslationUpdateHandlers[screenName]?(values)
+
+        // Call the specific handler registered by the host application, if any.
         self.translationUpdateHandlers[screenName]?(values)
         
         // ALWAYS update the bridge to trigger SwiftUI updates
@@ -2814,6 +2827,106 @@ public extension Cure {
                     }
                 }
                 .fade(duration: 0.25) // Add a subtle fade-in transition.
+        }
+    }
+
+    /// SwiftUI helper that automatically tracks a CMS-managed image key and renders it with caching.
+    ///
+    /// This view listens for real-time updates, so if the URL behind the provided key changes in the CMS,
+    /// the rendered image updates automatically. Internally it uses `CureImage` for observation and
+    /// Kingfisher for efficient memory/disk caching.
+    struct ManagedImage: View {
+        @StateObject private var imageModel: CureImage
+        private let contentMode: SwiftUICore.ContentMode
+        private let defaultImageName: String?
+
+        /// Creates a managed image for an on-screen asset (tab-specific).
+        /// - Parameters:
+        ///   - key: The image key as configured in the CMS.
+        ///   - tab: Optional tab/screen identifier if the image is scoped to a screen. Pass `nil`
+        ///          to use the global image library.
+        ///   - contentMode: How the rendered image should scale within its bounds. Defaults to `.fit`.
+        ///   - defaultImageName: Optional local asset name used when the CMS image is unavailable.
+        public init(
+            key: String,
+            tab: String = "__images__",
+            contentMode: SwiftUICore.ContentMode = .fit,
+            defaultImageName: String? = nil
+        ) {
+            _imageModel = StateObject(wrappedValue: CureImage(key, tab: tab))
+            self.contentMode = contentMode
+            self.defaultImageName = defaultImageName
+        }
+
+        public var body: some View {
+            Group {
+                if let url = imageModel.value {
+                    configuredImage(for: url)
+                } else {
+                    fallbackContent()
+                }
+            }
+        }
+
+        @ViewBuilder
+        private func configuredImage(for url: URL) -> some View {
+            let base = KFImage(url)
+                .resizable()
+                .cancelOnDisappear(true)
+                .cacheOriginalImage()
+                .loadDiskFileSynchronously()
+                .placeholder { placeholderContent(showProgress: true) }
+                .fade(duration: 0.25)
+
+            switch contentMode {
+            case .fit:
+                base.scaledToFit()
+            case .fill:
+                base.scaledToFill()
+            @unknown default:
+                base
+            }
+        }
+
+        @ViewBuilder
+        private func placeholderContent(showProgress: Bool = false) -> some View {
+            if let name = defaultImageName, !name.isEmpty {
+                fallbackImageView(named: name)
+            } else {
+                ZStack {
+                    Color.gray.opacity(0.08)
+                    if showProgress {
+                        ProgressView()
+                    }
+                }
+            }
+        }
+
+        @ViewBuilder
+        private func fallbackContent() -> some View {
+            if let name = defaultImageName, !name.isEmpty {
+                fallbackImageView(named: name)
+            } else {
+                ZStack {
+                    Color.gray.opacity(0.08)
+                    Image(systemName: "photo")
+                        .font(.title2)
+                        .foregroundColor(.gray)
+                }
+            }
+        }
+
+        @ViewBuilder
+        private func fallbackImageView(named name: String) -> some View {
+            let image = Image(name).resizable()
+            switch contentMode {
+            case .fit:
+                image.scaledToFit()
+            case .fill:
+                image.scaledToFill()
+            @unknown default:
+                image
+            }
         }
     }
 }
