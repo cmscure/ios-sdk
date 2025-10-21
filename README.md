@@ -270,23 +270,53 @@ Cure.shared.configure(
 
 **🚀 Enhanced with Automatic Real-time Updates!**
 
-Retrieve all items for a specific data store. The `getStoreItems(for:)` method now **automatically enables real-time updates** while maintaining 100% backward compatibility.
+Retrieve all items for a specific data store without juggling `JSONValue`.  
+Use the new `dataStoreRecords(for:)` helper to iterate through friendly wrappers:
 
 ```swift
-// Same method call, now with automatic real-time updates!
-let products = Cure.shared.getStoreItems(for: "products")
+let products = Cure.shared.dataStoreRecords(for: "products")
 
-// This automatically:
-// ✅ Returns immediate cached items array
-// ✅ Sets up real-time subscription for this data store in background  
-// ✅ Syncs store data if not already synced
-// ✅ Receives live data store updates from CMSCure dashboard
-
-// Use the items
 for product in products {
-    let name = product.data["name"]?.localizedString ?? "N/A"
-    let price = product.data["price"]?.doubleValue ?? 0.0
-    print("Product: \(name), Price: $\(price)")
+    let name = product.string("name") ?? "N/A"        // auto-localized
+    let price = product.double("price") ?? 0.0        // handles ints/doubles
+    let isFeatured = product.bool("is_featured") ?? false
+
+    print("Product: \(name) - $\(price) \(isFeatured ? "⭐️" : "")")
+}
+```
+
+Need direct access to the raw codable models? `product.raw` exposes the original `DataStoreItem`.
+
+> Still relying on the legacy API? `getStoreItems(for:)` remains available and now automatically
+> sets up the same real-time updates under the hood.
+
+**UIKit Example**
+
+```swift
+final class ProductsViewController: UIViewController {
+    private var records: [CureDataStoreRecord] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        updateContentFromCMS()
+    }
+
+    private func updateContentFromCMS() {
+        print("First name:", Cure.shared.translation(for: "f_name", inTab: "test"))
+        loadProducts()
+    }
+
+    private func loadProducts() {
+        records = Cure.shared.dataStoreRecords(for: "products")
+        for record in records {
+            print("Title:", record.string("title") ?? "nil")
+            print("Description:", record.string("description") ?? "nil")
+        }
+    }
+
+    @objc func cmsContentDidUpdate() {
+        updateContentFromCMS()
+    }
 }
 ```
 
@@ -343,10 +373,9 @@ Use `CureDataStore` wrapper to fetch and observe an entire collection of structu
 @StateObject private var productStore = CureDataStore(apiIdentifier: "products")
 
 //... in your view body
-List(productStore.items) { product in
-    // Access localized and non-localized fields
-    Text(product.data["name"]?.localizedString ?? "N/A")
-    Text("Price: \\(product.data["price"]?.doubleValue ?? 0.0)")
+List(productStore.records) { product in
+    Text(product.string("name") ?? "N/A")
+    Text("Price: \(product.double("price") ?? 0.0)")
 }
 ```
 

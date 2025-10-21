@@ -766,6 +766,22 @@ public class CMSCureSDK {
             return self.dataStoreCache[apiIdentifier] ?? []
         }
     }
+
+    /// Provides a simplified collection of data store records with convenient accessors.
+    ///
+    /// This helper mirrors the ergonomics of `translation(for:inTab:)` by letting UIKit
+    /// or SwiftUI callers fetch items and immediately iterate over user-friendly records.
+    /// Each record includes handy typed accessors (string/int/bool/double) and automatically
+    /// resolves localized fields using the SDK's currently selected language.
+    ///
+    /// Just like `getStoreItems`, this method sets up real-time updates the first time a
+    /// store is accessed and returns the most recent cached values synchronously.
+    ///
+    /// - Parameter apiIdentifier: The unique API identifier of the data store.
+    /// - Returns: An array of `CureDataStoreRecord` objects for easy iteration.
+    public func dataStoreRecords(for apiIdentifier: String) -> [CureDataStoreRecord] {
+        return getStoreItems(for: apiIdentifier).map { CureDataStoreRecord(item: $0) }
+    }
     
     private func setupAutoRealTimeUpdatesForDataStore(_ apiIdentifier: String) {
         DispatchQueue.main.async { [weak self] in
@@ -846,7 +862,7 @@ public class CMSCureSDK {
                 self.logError("Failed to decode data store '\(apiIdentifier)': \(error)")
                 DispatchQueue.main.async { completion(false) }
             }
-        }
+        }.resume()
     }
     
     /// Retrieves a color hex string for a given global color key.
@@ -2900,6 +2916,109 @@ public final class CureDataStore: ObservableObject {
             self.items = newItems
         }
     }
+    
+    /// Convenience accessor that converts the underlying `DataStoreItem` models into
+    /// ergonomic `CureDataStoreRecord` wrappers. Useful when rendering lists directly.
+    public var records: [CureDataStoreRecord] {
+        return items.map { CureDataStoreRecord(item: $0) }
+    }
+}
+
+/// Lightweight wrapper that exposes data store items with friendly accessors.
+///
+/// Each record keeps a reference to the original `DataStoreItem` while providing helpers to
+/// grab typed values (including automatic localization) and iterate through raw dictionaries
+/// without dealing with the lower-level `JSONValue` enum.
+public struct CureDataStoreRecord: Identifiable {
+    public let id: String
+    public let createdAtISO: String
+    public let updatedAtISO: String
+    
+    /// Access to the underlying codable representation in case the host app needs it.
+    public let raw: DataStoreItem
+    
+    private let fields: [String: JSONValue]
+    
+    internal init(item: DataStoreItem) {
+        self.id = item.id
+        self.createdAtISO = item.createdAt
+        self.updatedAtISO = item.updatedAt
+        self.fields = item.data
+        self.raw = item
+    }
+    
+    /// Returns the ISO-8601 `createdAt` timestamp as a `Date` if parsing succeeds.
+    public var createdAt: Date? {
+        ISO8601DateFormatter().date(from: createdAtISO)
+    }
+    
+    /// Returns the ISO-8601 `updatedAt` timestamp as a `Date` if parsing succeeds.
+    public var updatedAt: Date? {
+        ISO8601DateFormatter().date(from: updatedAtISO)
+    }
+    
+    /// Provides a simple dictionary (with localized strings flattened) for quick iteration.
+    public var dictionary: [String: Any] {
+        var result: [String: Any] = [:]
+        for (key, value) in fields {
+            if let resolved = value.resolvedValue() {
+                result[key] = resolved
+            }
+        }
+        return result
+    }
+    
+    /// Optionally supply a preferred language code when resolving localized fields.
+    public func dictionary(preferredLanguage language: String) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for (key, value) in fields {
+            if let resolved = value.resolvedValue(preferredLanguage: language) {
+                result[key] = resolved
+            }
+        }
+        return result
+    }
+    
+    /// Random-access convenience for template-style usage.
+    public subscript(key: String) -> Any? {
+        return fields[key]?.resolvedValue()
+    }
+    
+    /// Returns the field's `JSONValue` for advanced scenarios.
+    public func jsonValue(_ key: String) -> JSONValue? {
+        return fields[key]
+    }
+    
+    /// Resolves the field as a localized string using the active CMSCure language.
+    public func string(_ key: String) -> String? {
+        return fields[key]?.localizedString
+    }
+    
+    /// Resolves the field as a localized string using a custom language code.
+    public func string(_ key: String, language: String) -> String? {
+        return fields[key]?.resolvedValue(preferredLanguage: language) as? String
+    }
+    
+    /// Resolves the field as an integer.
+    public func int(_ key: String) -> Int? {
+        return fields[key]?.intValue
+    }
+    
+    /// Resolves the field as a boolean.
+    public func bool(_ key: String) -> Bool? {
+        return fields[key]?.boolValue
+    }
+    
+    /// Resolves the field as a double (covers both integer and floating point JSON).
+    public func double(_ key: String) -> Double? {
+        if let double = fields[key]?.doubleValue {
+            return double
+        }
+        if let int = fields[key]?.intValue {
+            return Double(int)
+        }
+        return nil
+    }
 }
 
 // MARK: - NEW: Public SDKImage View
@@ -3151,5 +3270,27 @@ public extension JSONValue {
         let currentLang = Cure.shared.getLanguage()
         // Prioritize current language, then English as a fallback, then any available language.
         return dict[currentLang] ?? dict["en"] ?? dict.values.first
+    }
+    
+    /// Resolves the value to a plain Swift type. Localized dictionaries automatically pick the
+    /// provided language (defaulting to the currently selected SDK language).
+    /// - Parameter language: Optional language code override.
+    /// - Returns: A Swift type (`String`, `Int`, `Double`, `Bool`) or `nil` for nulls/missing data.
+    func resolvedValue(preferredLanguage language: String? = nil) -> Any? {
+        switch self {
+            case .string(let value):
+                return value
+            case .int(let value):
+                return value
+            case .double(let value):
+                return value
+            case .bool(let value):
+                return value
+            case .localizedObject(let dict):
+                let preferredLanguage = language ?? Cure.shared.getLanguage()
+                return dict[preferredLanguage] ?? dict["en"] ?? dict.values.first
+            case .null:
+                return nil
+        }
     }
 }
