@@ -580,28 +580,44 @@ public class CMSCureSDK {
     /// This includes screens accessed via the translation() method when auto real-time updates are enabled.
     /// - Returns: An array of screen names that are auto-subscribed to real-time updates.
     public func getAutoSubscribedScreens() -> [String] {
-        return DispatchQueue.main.sync { Array(autoSubscribedScreens) }
+        if Thread.isMainThread {
+            return Array(autoSubscribedScreens)
+        } else {
+            return DispatchQueue.main.sync { Array(autoSubscribedScreens) }
+        }
     }
     
     /// Returns whether colors have been automatically subscribed to real-time updates.
     /// This reflects whether colorValue() has been called when auto real-time updates are enabled.
     /// - Returns: `true` if colors are auto-subscribed to real-time updates, `false` otherwise.
     public func isColorsAutoSubscribed() -> Bool {
-        return DispatchQueue.main.sync { autoSubscribedColors }
+        if Thread.isMainThread {
+            return autoSubscribedColors
+        } else {
+            return DispatchQueue.main.sync { autoSubscribedColors }
+        }
     }
     
     /// Returns whether global images have been automatically subscribed to real-time updates.
     /// This reflects whether imageURL() has been called when auto real-time updates are enabled.
     /// - Returns: `true` if global images are auto-subscribed to real-time updates, `false` otherwise.
     public func isGlobalImagesAutoSubscribed() -> Bool {
-        return DispatchQueue.main.sync { autoSubscribedGlobalImages }
+        if Thread.isMainThread {
+            return autoSubscribedGlobalImages
+        } else {
+            return DispatchQueue.main.sync { autoSubscribedGlobalImages }
+        }
     }
     
     /// Returns a list of data stores that have been automatically subscribed to real-time updates.
     /// This includes data stores accessed via the getStoreItems() method when auto real-time updates are enabled.
     /// - Returns: An array of data store API identifiers that are auto-subscribed to real-time updates.
     public func getAutoSubscribedDataStores() -> [String] {
-        return DispatchQueue.main.sync { Array(autoSubscribedDataStores) }
+        if Thread.isMainThread {
+            return Array(autoSubscribedDataStores)
+        } else {
+            return DispatchQueue.main.sync { Array(autoSubscribedDataStores) }
+        }
     }
     
     // MARK: - Public API - Cache Management
