@@ -145,6 +145,10 @@ public class CMSCureSDK {
     private var syncingScreens: Set<String> = []
     
     private var autoRegisteredScreens: Set<String> = []
+
+#if canImport(UIKit) && !os(watchOS)
+    private let legacyUIKitContentUpdateSelector = NSSelectorFromString("cmsContentDidUpdate")
+#endif
     
     // MARK: - Persistence File Paths
     // URLs for storing SDK data (cache, tabs, legacy config) in the app's Documents directory.
@@ -2303,6 +2307,10 @@ public class CMSCureSDK {
             object: nil, // Sender is nil, or could be `self`.
             userInfo: ["screenName": screenName] // Include the updated screen name.
         )
+
+#if canImport(UIKit) && !os(watchOS)
+        triggerLegacyUIKitContentRefresh(screenName: screenName)
+#endif
     }
     
     /// Notifies all registered handlers for a given screen name and posts a general update notification.
@@ -2332,7 +2340,113 @@ public class CMSCureSDK {
             object: nil,
             userInfo: ["screenName": screenName]
         )
+
+#if canImport(UIKit) && !os(watchOS)
+        triggerLegacyUIKitContentRefresh(screenName: screenName)
+#endif
     }
+    
+#if canImport(UIKit) && !os(watchOS)
+    private func triggerLegacyUIKitContentRefresh(screenName: String) {
+        if Thread.isMainThread {
+            performLegacyUIKitContentRefresh(screenName: screenName)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.performLegacyUIKitContentRefresh(screenName: screenName)
+            }
+        }
+    }
+    
+    private func performLegacyUIKitContentRefresh(screenName: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        
+        let sharedApplicationSelector = NSSelectorFromString("sharedApplication")
+        guard UIApplication.responds(to: sharedApplicationSelector),
+              let unmanagedApplication = UIApplication.perform(sharedApplicationSelector),
+              let application = unmanagedApplication.takeUnretainedValue() as? UIApplication else {
+            if debugLogsEnabled {
+                print("ℹ️ UIKit legacy refresh skipped: UIApplication.shared unavailable.")
+            }
+            return
+        }
+        
+        let candidateWindows: [UIWindow]
+        if #available(iOS 13.0, tvOS 13.0, *) {
+            candidateWindows = application.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap { $0.windows }
+        } else {
+            candidateWindows = application.windows
+        }
+        
+        if candidateWindows.isEmpty {
+            if debugLogsEnabled {
+                print("ℹ️ UIKit legacy refresh skipped: No active windows found.")
+            }
+            return
+        }
+        
+        if debugLogsEnabled {
+            print("📣 UIKit legacy refresh triggered for '\(screenName)' on \(candidateWindows.count) window(s).")
+        }
+        
+        var visitedControllers = Set<ObjectIdentifier>()
+        for window in candidateWindows {
+            if window.isHidden { continue }
+            if #available(iOS 13.0, tvOS 13.0, *) {
+                if let scene = window.windowScene,
+                   scene.activationState != .foregroundActive {
+                    continue
+                }
+            }
+            
+            if let rootViewController = window.rootViewController {
+                notifyLegacyUIKitControllers(from: rootViewController, visited: &visitedControllers)
+            }
+        }
+    }
+    
+    private func notifyLegacyUIKitControllers(from viewController: UIViewController, visited: inout Set<ObjectIdentifier>) {
+        let identifier = ObjectIdentifier(viewController)
+        guard !visited.contains(identifier) else { return }
+        visited.insert(identifier)
+        
+        let isVisible = viewController.isViewLoaded && (viewController.viewIfLoaded?.window != nil)
+        if viewController.responds(to: legacyUIKitContentUpdateSelector), isVisible {
+            if debugLogsEnabled {
+                print("📣 Invoking cmsContentDidUpdate on \(String(describing: type(of: viewController)))")
+            }
+            _ = viewController.perform(legacyUIKitContentUpdateSelector)
+        }
+        
+        for child in viewController.children {
+            notifyLegacyUIKitControllers(from: child, visited: &visited)
+        }
+        
+        if let presented = viewController.presentedViewController {
+            notifyLegacyUIKitControllers(from: presented, visited: &visited)
+        }
+        
+        if let navigationController = viewController as? UINavigationController {
+            for controller in navigationController.viewControllers {
+                notifyLegacyUIKitControllers(from: controller, visited: &visited)
+            }
+        }
+        
+        if let tabBarController = viewController as? UITabBarController,
+           let controllers = tabBarController.viewControllers {
+            for controller in controllers {
+                notifyLegacyUIKitControllers(from: controller, visited: &visited)
+            }
+        }
+        
+        if let splitViewController = viewController as? UISplitViewController {
+            for controller in splitViewController.viewControllers {
+                notifyLegacyUIKitControllers(from: controller, visited: &visited)
+            }
+        }
+    }
+#endif
     
     
     // MARK: - Available Languages Fetching
